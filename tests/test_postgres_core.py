@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +20,7 @@ from budget_bot.models import OperationStatus, OperationType, ParsedOperation, P
 from budget_bot.processor import OperationDecision, ProcessingResult, ScreenshotProcessor
 from budget_bot.storage import Storage, operation_hash
 from budget_bot.telegram_bot import (
+    MEDIA_GROUP_SETTLE_SECONDS,
     TELEGRAM_POLLING_CONFLICT_SLEEP_SECONDS,
     TELEGRAM_POLLING_ERROR_SLEEP_SECONDS,
     TelegramApiError,
@@ -350,6 +353,49 @@ def test_telegram_polling_conflict_uses_longer_retry_delay() -> None:
     assert generic_delay == TELEGRAM_POLLING_ERROR_SLEEP_SECONDS
 
 
+def test_telegram_album_flush_preserves_owner_scope() -> None:
+    class OwnerContext:
+        def __init__(self) -> None:
+            self.owner_id = "telegram:1"
+
+        @contextmanager
+        def owner_scope(self, owner: str):
+            previous = self.owner_id
+            self.owner_id = owner
+            try:
+                yield
+            finally:
+                self.owner_id = previous
+
+    class AlbumBot(TelegramBot):
+        def __init__(self, context: Any) -> None:
+            self.context = context
+            self.media_groups: dict[str, dict[str, Any]] = {}
+            self.handled_owner_ids: list[str] = []
+
+        def _handle_photo_group(self, group: dict[str, Any]) -> None:
+            self.handled_owner_ids.append(self.context.owner_id)
+
+    context = OwnerContext()
+    bot = AlbumBot(context)
+
+    bot._queue_media_group_photo(
+        {
+            "chat": {"id": 100},
+            "media_group_id": "album-1",
+            "photo": [{"file_id": "file-1"}],
+        }
+    )
+    context.owner_id = "default"
+    for group in bot.media_groups.values():
+        group["updated_at"] = time.monotonic() - MEDIA_GROUP_SETTLE_SECONDS - 1
+
+    bot._flush_ready_media_groups()
+
+    assert bot.handled_owner_ids == ["telegram:1"]
+    assert context.owner_id == "default"
+
+
 def test_telegram_processing_result_shows_written_summary_with_pending_items(tmp_path: Path) -> None:
     written = make_operation(name="Пятерочка")
     pending = ParsedOperation(
@@ -420,9 +466,51 @@ def test_telegram_processing_result_shows_written_summary_with_pending_items(tmp
     bot = FakeTelegramBot(context)
     bot._send_processing_result(100, result)
 
+    surf_messages = [message for message in bot.sent_messages if "Surf Coffee" in message["text"]]
     assert any(message["text"].startswith("Засчитано:") for message in bot.sent_messages)
-    assert any("Решить: Surf Coffee" in message["text"] for message in bot.sent_messages)
+    assert len(surf_messages) == 1
+    assert surf_messages[0]["reply_markup"] is not None
+    assert surf_messages[0]["message_id"] == pending_actions[0]["message_id"]
     assert pending_actions
+
+
+def test_telegram_quantity_choice_writes_selected_duplicate_count(tmp_path: Path) -> None:
+    storage = Storage(DATABASE_URL)
+    owner = owner_id()
+    operation = ParsedOperation(
+        date=date(2026, 8, 6),
+        name="Метроэлектротранс",
+        amount=-46,
+        type=OperationType.EXPENSE,
+        category="Транспорт",
+        subcategory="Местный транспорт",
+        occurrence_count=2,
+        occurrence_confirmed=False,
+    )
+
+    with storage.owner_scope(owner):
+        op_hash = operation_hash("tbank", operation)
+        storage.record_operation(op_hash, "image-qty", "tbank", operation, OperationStatus.PENDING)
+        storage.add_pending_action(op_hash, chat_id=100, message_id=10, prompt="Выбери количество одинаковых операций")
+        bot = FakeTelegramBot(make_context(storage, owner, tmp_path))
+        bot._handle_callback(
+            {
+                "id": "callback-1",
+                "from": {"id": 1},
+                "data": f"qty:{op_hash}:2",
+                "message": {"chat": {"id": 100}, "message_id": 10},
+            }
+        )
+        entries = storage.budget_entries(date(2026, 8, 1), date(2026, 8, 31))
+        updated_row = storage.get_operation(op_hash)
+        pending = storage.get_pending_action(op_hash, 100)
+
+    assert len(entries) == 2
+    assert {entry["name"] for entry in entries} == {"Метроэлектротранс"}
+    assert sum(entry["amount"] for entry in entries) == 92
+    assert updated_row["status"] == OperationStatus.AUTO_WRITTEN.value
+    assert pending is None
+    assert (100, 10) in bot.deleted_messages
 
 
 def test_cli_check_sync_mock_run_and_export_excel(tmp_path: Path) -> None:

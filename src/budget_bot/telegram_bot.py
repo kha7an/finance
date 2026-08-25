@@ -181,6 +181,7 @@ class TelegramBot:
             {
                 "chat_id": chat_id,
                 "media_group_id": media_group_id,
+                "owner_id": self.context.owner_id,
                 "messages": [],
                 "updated_at": time.monotonic(),
             },
@@ -202,7 +203,12 @@ class TelegramBot:
         ]
         for key in ready_keys:
             group = self.media_groups.pop(key)
-            self._handle_photo_group(group)
+            owner_id = str(group.get("owner_id") or "")
+            if owner_id:
+                with self.context.owner_scope(owner_id):
+                    self._handle_photo_group(group)
+            else:
+                self._handle_photo_group(group)
 
     def _handle_photo_group(self, group: Dict[str, Any]) -> None:
         chat_id = int(group["chat_id"])
@@ -1083,14 +1089,23 @@ class TelegramBot:
             reply_markup=self._subcategory_keyboard(operation_hash, category_index),
         )
 
-    def _send_quantity_picker(self, chat_id: int, operation_hash: str, operation: ParsedOperation) -> None:
-        self._send_message(
+    def _send_quantity_picker(
+        self,
+        chat_id: int,
+        operation_hash: str,
+        operation: ParsedOperation,
+        prefix: Optional[str] = None,
+    ) -> Optional[int]:
+        text = (
+            f"Нашел одинаковые операции: {operation.name or 'операция'} / "
+            f"{operation.amount:.2f} ₽ - {operation.occurrence_count} шт. "
+            "Сколько записать?"
+        )
+        if prefix:
+            text = f"{prefix}\n\n{text}"
+        return self._send_message(
             chat_id,
-            (
-                f"Нашел одинаковые операции: {operation.name or 'операция'} / "
-                f"{operation.amount:.2f} ₽ - {operation.occurrence_count} шт. "
-                "Сколько записать?"
-            ),
+            text,
             reply_markup=self._quantity_keyboard(operation_hash, operation.occurrence_count),
         )
 
@@ -1250,14 +1265,13 @@ class TelegramBot:
                 )
                 continue
             if _needs_quantity(decision.operation):
-                message_id = self._send_message(chat_id, text)
+                message_id = self._send_quantity_picker(chat_id, op_hash, decision.operation, prefix=text)
                 self.context.storage.add_pending_action(
                     operation_hash=op_hash,
                     chat_id=chat_id,
                     message_id=message_id,
                     prompt="Выбери количество одинаковых операций",
                 )
-                self._send_quantity_picker(chat_id, op_hash, decision.operation)
                 continue
             self._send_message(
                 chat_id,
