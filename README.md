@@ -224,5 +224,3 @@ Excel больше не является хранилищем. Он формир
 ```bash
 OPENAI_MODEL=gpt-4.1-mini
 ```
-# finance
-# finance

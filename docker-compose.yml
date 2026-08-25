@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: budget_bot
+      POSTGRES_USER: budget_bot
+      POSTGRES_PASSWORD: budget_bot
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U budget_bot -d budget_bot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  bot:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://budget_bot:budget_bot@postgres:5432/budget_bot
+      BUDGET_EXPORT_DIR: /app/data/exports
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "budget_bot.cli", "telegram"]
+    restart: unless-stopped
+
+  api:
+    build: .
+    profiles: ["api"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://budget_bot:budget_bot@postgres:5432/budget_bot
+      BUDGET_EXPORT_DIR: /app/data/exports
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["uvicorn", "budget_bot.server:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+
+  tests:
+    build: .
+    profiles: ["test"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://budget_bot:budget_bot@postgres:5432/budget_bot
+      BUDGET_EXPORT_DIR: /app/data/exports
+      LLM_PROVIDER: mock
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["pytest"]
+
+volumes:
+  postgres-data:

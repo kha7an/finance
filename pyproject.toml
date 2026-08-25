@@ -1,0 +1,20 @@
+[project]
+name = "budget-bot"
+version = "0.1.0"
+description = "Local Telegram bot that parses bank screenshots and writes budget operations to Excel."
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi==0.115.6",
+  "uvicorn[standard]==0.32.1",
+  "openpyxl==3.1.5",
+  "PyYAML==6.0.2",
+  "requests==2.32.3",
+  "python-multipart==0.0.20",
+  "gspread==6.2.1",
+  "psycopg[binary,pool]==3.2.10",
+  "pytest==8.3.4",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

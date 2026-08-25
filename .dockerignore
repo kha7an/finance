@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.git
+.idea
+.pytest_cache
+.venv
+__pycache__
+*.py[cod]
+data/budget_bot*.sqlite3
+data/images/*
+data/exports/*
+*.xlsx
+*.before-*
