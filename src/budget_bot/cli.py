@@ -12,6 +12,7 @@ from .categories import missing_required_subcategories
 from .excel_exporter import ExcelExporter
 from .mock_data import sample_image_content, sample_screenshot_payload
 from .models import ParsedScreenshot
+from .storage import operation_from_json, telegram_owner_id
 from .telegram_bot import _expense_report_lines, _parse_stats_period
 from .telegram_bot import TelegramBot
 
@@ -32,6 +33,11 @@ def main() -> None:
 
     stats = subparsers.add_parser("stats", help="Show expense stats from Postgres.")
     stats.add_argument("period", nargs="?", help="Optional period like 01.08-24.08.")
+
+    debug_entries = subparsers.add_parser("debug-entries", help="Print recent operations and budget entries.")
+    debug_entries.add_argument("--owner", default="default", help="Owner id, e.g. default or telegram:123.")
+    debug_entries.add_argument("--telegram-user-id", type=int, help="Use owner id for this Telegram user.")
+    debug_entries.add_argument("--limit", type=int, default=10)
 
     parse_image = subparsers.add_parser("parse-image", help="Parse one local image through configured LLM.")
     parse_image.add_argument("path", type=Path)
@@ -123,6 +129,27 @@ def main() -> None:
             start_date, end_date = today.replace(day=1), today
         for line in _expense_report_lines(context.storage.expense_summary(start_date, end_date)):
             print(line)
+        return
+
+    if args.command == "debug-entries":
+        owner_id = telegram_owner_id(args.telegram_user_id) if args.telegram_user_id is not None else args.owner
+        with context.owner_scope(owner_id):
+            print(f"Owner: {context.owner_id}")
+            print("Recent budget entries:")
+            for row in context.storage.recent_budget_entries(args.limit):
+                print(
+                    f"- #{row['id']} {row['operation_date']} {row['operation_type']} "
+                    f"{row['amount']:.2f} {row.get('category') or '-'} / {row.get('subcategory') or '-'} "
+                    f"{row['name']}"
+                )
+            print("Recent operations:")
+            for row in context.storage.recent_operations(args.limit):
+                operation = operation_from_json(row["operation_json"])
+                print(
+                    f"- {row['status']} row={row.get('workbook_row')} "
+                    f"{operation.date} {operation.type.value} {operation.amount:.2f} {operation.name} "
+                    f"note={row.get('status_note') or '-'}"
+                )
         return
 
     if args.command == "mock-run":

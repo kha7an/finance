@@ -1219,11 +1219,10 @@ class TelegramBot:
         pending = [item for item in result.decisions if item.status == OperationStatus.PENDING]
         ignored = [item for item in result.decisions if item.status == OperationStatus.IGNORED]
 
-        if not pending:
-            if written:
-                self._send_message(chat_id, "\n".join(_written_summary_lines(written)))
-            elif ignored:
-                self._send_message(chat_id, "Ничего нового не записал.")
+        if written:
+            self._send_message(chat_id, "\n".join(_written_summary_lines(written)))
+        elif ignored and not pending:
+            self._send_message(chat_id, "Ничего нового не записал.")
 
         for decision in pending:
             op_hash = self._find_operation_hash(result.bank, decision.operation)

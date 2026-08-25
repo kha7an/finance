@@ -772,6 +772,36 @@ class Storage:
             ).fetchall()
             return [_entry_row(row) for row in rows]
 
+    def recent_budget_entries(self, limit: int = 10) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, owner_id, source, operation_hash,
+                       export_sheet AS workbook_sheet, export_row AS workbook_row,
+                       operation_date, operation_type, amount, category, subcategory,
+                       name, note, bank, created_at, updated_at
+                FROM budget_entries
+                WHERE owner_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (self.owner_id, limit),
+            ).fetchall()
+            return [_entry_row(row) for row in rows]
+
+    def recent_operations(self, limit: int = 10) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM operations
+                WHERE owner_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (self.owner_id, limit),
+            ).fetchall()
+            return [_row_dict(row) for row in rows]
+
     def get_budget_entry(self, entry_id: int) -> Optional[Dict[str, Any]]:
         with self._connect() as connection:
             row = connection.execute(

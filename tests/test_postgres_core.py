@@ -15,7 +15,7 @@ from budget_bot.app_factory import AppContext
 from budget_bot.config import Settings
 from budget_bot.excel_exporter import ExcelExporter
 from budget_bot.models import OperationStatus, OperationType, ParsedOperation, ParsedScreenshot
-from budget_bot.processor import ScreenshotProcessor
+from budget_bot.processor import OperationDecision, ProcessingResult, ScreenshotProcessor
 from budget_bot.storage import Storage, operation_hash
 from budget_bot.telegram_bot import (
     TELEGRAM_POLLING_CONFLICT_SLEEP_SECONDS,
@@ -348,6 +348,81 @@ def test_telegram_polling_conflict_uses_longer_retry_delay() -> None:
 
     assert conflict_delay == TELEGRAM_POLLING_CONFLICT_SLEEP_SECONDS
     assert generic_delay == TELEGRAM_POLLING_ERROR_SLEEP_SECONDS
+
+
+def test_telegram_processing_result_shows_written_summary_with_pending_items(tmp_path: Path) -> None:
+    written = make_operation(name="Пятерочка")
+    pending = ParsedOperation(
+        date=date(2026, 8, 1),
+        name="Surf Coffee",
+        amount=-340,
+        type=OperationType.EXPENSE,
+        category="Еда",
+        subcategory="Кофе",
+        occurrence_count=2,
+        occurrence_confirmed=False,
+    )
+    result = ProcessingResult(
+        image_hash="image-with-written-and-pending",
+        bank="tbank",
+        decisions=[
+            OperationDecision(written, OperationStatus.AUTO_WRITTEN, "auto written", workbook_row=1),
+            OperationDecision(pending, OperationStatus.PENDING, "same operation appears 2 times"),
+        ],
+    )
+    pending_actions: list[dict[str, Any]] = []
+
+    class FakeStorage:
+        def add_pending_action(
+            self,
+            operation_hash: str,
+            chat_id: int,
+            message_id: int | None,
+            prompt: str,
+        ) -> None:
+            pending_actions.append(
+                {
+                    "operation_hash": operation_hash,
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "prompt": prompt,
+                }
+            )
+
+    context = SimpleNamespace(
+        settings=Settings(
+            telegram_bot_token="test-token",
+            telegram_allowed_user_ids={1},
+            telegram_allow_all=False,
+            telegram_api_base_url="https://api.telegram.org",
+            telegram_file_base_url="https://api.telegram.org/file",
+            telegram_proxy_url="",
+            telegram_timeout_seconds=1,
+            use_env_proxy=False,
+            llm_provider="mock",
+            openai_api_key="",
+            openai_model="gpt-4o-mini",
+            openai_proxy_url="",
+            openai_timeout_seconds=1,
+            gemini_api_key="",
+            gemini_model="gemini-2.5-flash",
+            database_url=DATABASE_URL,
+            google_credentials_path=Path("data/google-service-account.json"),
+            export_dir=tmp_path,
+            default_timezone="Europe/Moscow",
+            reminder_enabled=False,
+            reminder_default_time="21:00",
+            api_token="",
+            max_upload_bytes=10 * 1024 * 1024,
+        ),
+        storage=FakeStorage(),
+    )
+    bot = FakeTelegramBot(context)
+    bot._send_processing_result(100, result)
+
+    assert any(message["text"].startswith("Засчитано:") for message in bot.sent_messages)
+    assert any("Решить: Surf Coffee" in message["text"] for message in bot.sent_messages)
+    assert pending_actions
 
 
 def test_cli_check_sync_mock_run_and_export_excel(tmp_path: Path) -> None:
