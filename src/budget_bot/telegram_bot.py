@@ -1223,6 +1223,12 @@ class TelegramBot:
             self._send_message(chat_id, "\n".join(_written_summary_lines(written)))
         elif ignored and not pending:
             self._send_message(chat_id, "Ничего нового не записал.")
+        elif pending:
+            self._send_message(
+                chat_id,
+                f"Пока ничего не записал автоматически: нужно решить {len(pending)} операций.",
+                reply_markup=self._main_reply_keyboard(),
+            )
 
         for decision in pending:
             op_hash = self._find_operation_hash(result.bank, decision.operation)

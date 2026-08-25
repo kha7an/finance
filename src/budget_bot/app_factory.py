@@ -99,7 +99,7 @@ class AppContext:
         )
         print(
             f"Parse pipeline: processor done elapsed={time.monotonic() - process_started_at:.2f}s "
-            f"total={time.monotonic() - started_at:.2f}s decisions={len(result.decisions)}",
+            f"total={time.monotonic() - started_at:.2f}s {_decision_counts_text(result.decisions)}",
             flush=True,
         )
         return result
@@ -136,7 +136,7 @@ class AppContext:
         )
         print(
             f"Parse pipeline: processor done elapsed={time.monotonic() - process_started_at:.2f}s "
-            f"total={time.monotonic() - started_at:.2f}s decisions={len(result.decisions)}",
+            f"total={time.monotonic() - started_at:.2f}s {_decision_counts_text(result.decisions)}",
             flush=True,
         )
         return result
@@ -153,3 +153,14 @@ def _combined_image_content(images: list[tuple[bytes, str]]) -> bytes:
         chunks.append(str(len(content)).encode("ascii"))
         chunks.append(content)
     return b"\0".join(chunks)
+
+
+def _decision_counts_text(decisions) -> str:
+    counts: Dict[str, int] = {}
+    reasons: Dict[str, int] = {}
+    for decision in decisions:
+        counts[decision.status.value] = counts.get(decision.status.value, 0) + 1
+        reasons[decision.reason] = reasons.get(decision.reason, 0) + 1
+    count_text = ", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "none"
+    reason_text = ", ".join(f"{key}={value}" for key, value in sorted(reasons.items())) or "none"
+    return f"decisions={len(decisions)} statuses=[{count_text}] reasons=[{reason_text}]"
