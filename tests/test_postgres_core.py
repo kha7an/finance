@@ -17,7 +17,12 @@ from budget_bot.excel_exporter import ExcelExporter
 from budget_bot.models import OperationStatus, OperationType, ParsedOperation, ParsedScreenshot
 from budget_bot.processor import ScreenshotProcessor
 from budget_bot.storage import Storage, operation_hash
-from budget_bot.telegram_bot import TelegramBot
+from budget_bot.telegram_bot import (
+    TELEGRAM_POLLING_CONFLICT_SLEEP_SECONDS,
+    TELEGRAM_POLLING_ERROR_SLEEP_SECONDS,
+    TelegramApiError,
+    TelegramBot,
+)
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://budget_bot:budget_bot@127.0.0.1:5433/budget_bot")
@@ -333,6 +338,16 @@ def test_telegram_export_sends_workbook_and_sync_is_deprecated(tmp_path: Path) -
     assert len(bot.sent_documents) == 1
     assert bot.sent_documents[0].exists()
     assert any("Синхронизации с Excel больше нет" in message["text"] for message in bot.sent_messages)
+
+
+def test_telegram_polling_conflict_uses_longer_retry_delay() -> None:
+    bot = TelegramBot.__new__(TelegramBot)
+
+    conflict_delay = bot._polling_error_sleep_seconds(TelegramApiError("conflict", status_code=409))
+    generic_delay = bot._polling_error_sleep_seconds(RuntimeError("network down"))
+
+    assert conflict_delay == TELEGRAM_POLLING_CONFLICT_SLEEP_SECONDS
+    assert generic_delay == TELEGRAM_POLLING_ERROR_SLEEP_SECONDS
 
 
 def test_cli_check_sync_mock_run_and_export_excel(tmp_path: Path) -> None:

@@ -32,6 +32,14 @@ from .telegram_manual import (
 
 MEDIA_GROUP_SETTLE_SECONDS = 2.0
 REMINDER_CHECK_SECONDS = 60.0 * 60
+TELEGRAM_POLLING_ERROR_SLEEP_SECONDS = 5.0
+TELEGRAM_POLLING_CONFLICT_SLEEP_SECONDS = 60.0
+
+
+class TelegramApiError(RuntimeError):
+    def __init__(self, message: str, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class TelegramBot:
@@ -58,10 +66,17 @@ class TelegramBot:
         self.media_groups: Dict[str, Dict[str, Any]] = {}
 
     def run_polling(self) -> None:
-        me = self.check_connection()
-        username = me.get("username") or me.get("first_name") or me.get("id")
-        print(f"Telegram polling started for @{username}. Press Ctrl+C to stop.", flush=True)
-        self._api("deleteWebhook", {"drop_pending_updates": False})
+        while True:
+            try:
+                me = self.check_connection()
+                username = me.get("username") or me.get("first_name") or me.get("id")
+                print(f"Telegram polling started for @{username}. Press Ctrl+C to stop.", flush=True)
+                self._api("deleteWebhook", {"drop_pending_updates": False})
+                break
+            except Exception as exc:
+                print(f"Telegram polling startup error: {exc}", flush=True)
+                time.sleep(self._polling_error_sleep_seconds(exc))
+
         offset: Optional[int] = None
         while True:
             try:
@@ -80,7 +95,7 @@ class TelegramBot:
                 time.sleep(0.5)
             except Exception as exc:
                 print(f"Telegram polling error: {exc}", flush=True)
-                time.sleep(5)
+                time.sleep(self._polling_error_sleep_seconds(exc))
 
     def check_connection(self) -> Dict[str, Any]:
         return self._api("getMe", {})["result"]
@@ -1286,15 +1301,25 @@ class TelegramBot:
         return path
 
     def _api(self, method: str, payload: Dict[str, Any], timeout: Optional[int] = None) -> Dict[str, Any]:
+        response: Optional[requests.Response] = None
         try:
             response = self.session.post(f"{self.base_url}/{method}", json=payload, timeout=timeout or self.timeout)
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise RuntimeError(self._sanitize_error(f"Telegram API {method} failed: {exc}")) from None
+            status_code = response.status_code if response is not None else None
+            raise TelegramApiError(
+                self._sanitize_error(f"Telegram API {method} failed: {exc}"),
+                status_code=status_code,
+            ) from None
         data = response.json()
         if not data.get("ok"):
-            raise RuntimeError(self._sanitize_error(str(data)))
+            raise TelegramApiError(self._sanitize_error(str(data)), status_code=data.get("error_code"))
         return data
+
+    def _polling_error_sleep_seconds(self, exc: Exception) -> float:
+        if isinstance(exc, TelegramApiError) and exc.status_code == 409:
+            return TELEGRAM_POLLING_CONFLICT_SLEEP_SECONDS
+        return TELEGRAM_POLLING_ERROR_SLEEP_SECONDS
 
     def _send_message(
         self,
