@@ -225,3 +225,4 @@ Excel больше не является хранилищем. Он формир
 OPENAI_MODEL=gpt-4.1-mini
 ```
 # finance
+# finance
