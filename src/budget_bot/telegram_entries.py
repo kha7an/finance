@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Dict, Optional
 
 from .models import OperationType, ParsedOperation
@@ -79,10 +79,11 @@ class TelegramEntryEditor:
             self.send_entry_delete_confirmation(chat_id, entry)
             return
         if action == "edelok":
+            operation_date = date.fromisoformat(str(entry["operation_date"]))
             self.delete_budget_entry(entry)
             self.bot._answer_callback(callback["id"], "Удалено")
             self.bot._delete_callback_message(callback)
-            self.bot._send_message(chat_id, "Запись удалена.", reply_markup=self.bot._main_reply_keyboard())
+            self.send_entry_list(chat_id, operation_date, operation_date)
             return
         if action in {"eamt", "edate", "ename"}:
             prompt = {
@@ -255,6 +256,15 @@ class TelegramEntryEditor:
     ) -> None:
         total = self.bot.context.storage.count_budget_entries(start_date, end_date, category=category)
         if total == 0:
+            if start_date == end_date:
+                rows = _entry_day_nav_rows(start_date, category)
+                rows.append([{"text": "Главное меню", "callback_data": "menu:home"}])
+                self.bot._send_message(
+                    chat_id,
+                    f"За {start_date.strftime('%d.%m')} записей не нашел.",
+                    reply_markup={"inline_keyboard": rows},
+                )
+                return
             self.bot._send_message(chat_id, "За этот период записей не нашел.", reply_markup=self.bot._main_reply_keyboard())
             return
         total_pages = max(1, (total + ENTRY_LIST_PAGE_SIZE - 1) // ENTRY_LIST_PAGE_SIZE)
@@ -286,6 +296,8 @@ class TelegramEntryEditor:
             nav_row.append({"text": "Вперёд ▶️", "callback_data": f"entrylist:{list_payload}:{page + 1}"})
         if nav_row:
             rows.append(nav_row)
+        if start_date == end_date:
+            rows.extend(_entry_day_nav_rows(start_date, category))
         rows.append([{"text": "🔍 Найти", "callback_data": f"entryfind:{list_payload}"}])
         rows.append([{"text": "Главное меню", "callback_data": "menu:home"}])
         self.bot._send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": rows})
@@ -416,6 +428,23 @@ def expense_report_keyboard(start_date: date, end_date: date, category: Optional
 def _entrylist_payload(start_date: date, end_date: date, category: Optional[str] = None) -> str:
     category_payload = category or "all"
     return f"{start_date.isoformat()}:{end_date.isoformat()}:{category_payload}"
+
+
+def _entry_day_nav_rows(current_date: date, category: Optional[str] = None) -> list[list[Dict[str, str]]]:
+    previous_date = current_date - timedelta(days=1)
+    next_date = current_date + timedelta(days=1)
+    return [
+        [
+            {
+                "text": f"← {previous_date.strftime('%d.%m')}",
+                "callback_data": f"entrylist:{_entrylist_payload(previous_date, previous_date, category)}",
+            },
+            {
+                "text": f"{next_date.strftime('%d.%m')} →",
+                "callback_data": f"entrylist:{_entrylist_payload(next_date, next_date, category)}",
+            },
+        ]
+    ]
 
 
 def _parse_entrylist_payload(text: str) -> Optional[tuple[date, date, Optional[str], int]]:

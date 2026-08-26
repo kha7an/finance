@@ -275,7 +275,7 @@ class TelegramBot:
         if action in ENTRY_ACTIONS:
             self._entry_editor().handle_callback(callback, chat_id, action, payload)
             return
-        if action in {"menu", "stats", "statscat", "sync", "analytics", "chart"}:
+        if action in {"menu", "stats", "statscat", "statsdate", "statsrange", "sync", "analytics", "chart"}:
             self._handle_stats_callback(callback, chat_id, action, payload)
             return
         if action in MANUAL_ACTIONS:
@@ -867,9 +867,15 @@ class TelegramBot:
                 self._send_category_report_picker(chat_id)
                 return
             if payload == "period":
-                self._send_message(chat_id, "Напиши дату или период так: 01.08 или 01.08-24.08", reply_markup=self._main_reply_keyboard())
+                self._send_stats_period_picker(chat_id)
                 return
             self._send_expense_report(chat_id, today.replace(day=1), today)
+            return
+        if action == "statsdate":
+            self._handle_stats_date_callback(chat_id, payload, today)
+            return
+        if action == "statsrange":
+            self._handle_stats_range_callback(chat_id, payload, today)
             return
         if action == "statscat":
             index = _parse_index(payload, 0)
@@ -1021,6 +1027,122 @@ class TelegramBot:
         rows = _button_rows(buttons, columns=2)
         rows.append([{"text": "Назад", "callback_data": "menu:home"}])
         self._send_message(chat_id, "Выбери категорию:", reply_markup={"inline_keyboard": rows})
+
+    def _send_stats_period_picker(self, chat_id: int) -> None:
+        self._send_message(
+            chat_id,
+            "Выбери дату кнопками или напиши вручную: 01.08 или 01.08-24.08",
+            reply_markup={
+                "inline_keyboard": [
+                    [
+                        {"text": "Один день", "callback_data": "statsdate:day"},
+                        {"text": "Период", "callback_data": "statsrange:startday"},
+                    ],
+                    [{"text": "Назад", "callback_data": "analytics:menu"}],
+                ]
+            },
+        )
+
+    def _handle_stats_date_callback(self, chat_id: int, payload: str, today: date) -> None:
+        parts = payload.split(":")
+        step = parts[0] if parts else ""
+        if step == "day":
+            self._send_stats_day_picker(chat_id, "statsdate:month", "Выбери день:")
+            return
+        if step == "month" and len(parts) >= 2:
+            day = _safe_int(parts[1])
+            if day is None:
+                self._send_stats_period_picker(chat_id)
+                return
+            self._send_stats_month_picker(chat_id, f"statsdate:show:{day}", "Выбери месяц:")
+            return
+        if step == "show" and len(parts) >= 3:
+            day = _safe_int(parts[1])
+            month = _safe_int(parts[2])
+            selected_date = _date_from_day_month(day, month, today.year)
+            if selected_date is None:
+                self._send_message(chat_id, "Такой даты нет. Выбери заново.")
+                self._send_stats_day_picker(chat_id, "statsdate:month", "Выбери день:")
+                return
+            self._send_expense_report(chat_id, selected_date, selected_date)
+            return
+        self._send_stats_period_picker(chat_id)
+
+    def _handle_stats_range_callback(self, chat_id: int, payload: str, today: date) -> None:
+        parts = payload.split(":")
+        step = parts[0] if parts else ""
+        if step == "startday":
+            self._send_stats_day_picker(chat_id, "statsrange:startmonth", "Начало периода: выбери день")
+            return
+        if step == "startmonth" and len(parts) >= 2:
+            day = _safe_int(parts[1])
+            if day is None:
+                self._send_stats_period_picker(chat_id)
+                return
+            self._send_stats_month_picker(chat_id, f"statsrange:endday:{day}", "Начало периода: выбери месяц")
+            return
+        if step == "endday" and len(parts) >= 3:
+            start_date = _date_from_day_month(_safe_int(parts[1]), _safe_int(parts[2]), today.year)
+            if start_date is None:
+                self._send_message(chat_id, "Такой начальной даты нет. Выбери период заново.")
+                self._send_stats_day_picker(chat_id, "statsrange:startmonth", "Начало периода: выбери день")
+                return
+            self._send_stats_day_picker(
+                chat_id,
+                f"statsrange:endmonth:{start_date.isoformat()}",
+                f"Конец периода от {start_date.strftime('%d.%m')}: выбери день",
+            )
+            return
+        if step == "endmonth" and len(parts) >= 3:
+            try:
+                start_date = date.fromisoformat(parts[1])
+            except ValueError:
+                start_date = None
+            end_day = _safe_int(parts[2])
+            if start_date is None:
+                self._send_stats_period_picker(chat_id)
+                return
+            self._send_stats_month_picker(
+                chat_id,
+                f"statsrange:show:{start_date.isoformat()}:{end_day}",
+                f"Конец периода от {start_date.strftime('%d.%m')}: выбери месяц",
+            )
+            return
+        if step == "show" and len(parts) >= 4:
+            try:
+                start_date = date.fromisoformat(parts[1])
+            except ValueError:
+                start_date = None
+            end_day = _safe_int(parts[2])
+            end_month = _safe_int(parts[3])
+            end_date = _date_from_day_month(end_day, end_month, today.year)
+            if start_date is None or end_date is None:
+                self._send_message(chat_id, "Такой даты нет. Выбери период заново.")
+                self._send_stats_day_picker(chat_id, "statsrange:startmonth", "Начало периода: выбери день")
+                return
+            if end_date < start_date:
+                start_date, end_date = end_date, start_date
+            self._send_expense_report(chat_id, start_date, end_date)
+            return
+        self._send_stats_period_picker(chat_id)
+
+    def _send_stats_day_picker(self, chat_id: int, callback_prefix: str, text: str) -> None:
+        buttons = [
+            {"text": str(day), "callback_data": f"{callback_prefix}:{day}"}
+            for day in range(1, 32)
+        ]
+        rows = _button_rows(buttons, columns=7)
+        rows.append([{"text": "Назад", "callback_data": "stats:period"}])
+        self._send_message(chat_id, text, reply_markup={"inline_keyboard": rows})
+
+    def _send_stats_month_picker(self, chat_id: int, callback_prefix: str, text: str) -> None:
+        buttons = [
+            {"text": f"{month:02d}", "callback_data": f"{callback_prefix}:{month}"}
+            for month in range(1, 13)
+        ]
+        rows = _button_rows(buttons, columns=4)
+        rows.append([{"text": "Назад", "callback_data": "stats:period"}])
+        self._send_message(chat_id, text, reply_markup={"inline_keyboard": rows})
 
     def _send_analytics_menu(self, chat_id: int) -> None:
         self._send_message(
@@ -1456,6 +1578,22 @@ def _parse_category_pair(text: str) -> tuple[Optional[str], Optional[str]]:
         return None, None
     category, subcategory = text.split("/", 1)
     return category.strip(), subcategory.strip()
+
+
+def _safe_int(text: object) -> Optional[int]:
+    try:
+        return int(str(text))
+    except (TypeError, ValueError):
+        return None
+
+
+def _date_from_day_month(day: Optional[int], month: Optional[int], year: int) -> Optional[date]:
+    if day is None or month is None:
+        return None
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
 
 
 def _parse_reminder_time(text: str) -> Optional[local_time]:
