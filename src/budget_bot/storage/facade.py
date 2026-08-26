@@ -737,7 +737,7 @@ class Storage(DbConnection):
                        name, note, bank, created_at, updated_at
                 FROM budget_entries
                 WHERE {" AND ".join(clauses)}
-                ORDER BY operation_date DESC, id DESC
+                ORDER BY operation_date DESC, id ASC
                 LIMIT %s OFFSET %s
                 """,
                 params,
@@ -810,7 +810,7 @@ class Storage(DbConnection):
                        name, note, bank, created_at, updated_at
                 FROM budget_entries
                 WHERE {" AND ".join(clauses)}
-                ORDER BY operation_date DESC, id DESC
+                ORDER BY operation_date DESC, id ASC
                 LIMIT %s
                 """,
                 params,

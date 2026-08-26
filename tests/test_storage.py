@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any, Iterator
 
+from budget_bot.models import OperationType
 from budget_bot.storage import Storage
 from budget_bot.storage.helpers import DEFAULT_OWNER_ID
 
@@ -11,8 +12,12 @@ class FakeConnection:
     def __init__(self) -> None:
         self.calls: list[tuple[str, Any]] = []
 
-    def execute(self, query: str, params: Any = None) -> None:
+    def execute(self, query: str, params: Any = None):
         self.calls.append((query, params))
+        return self
+
+    def fetchall(self) -> list[Any]:
+        return []
 
 
 def test_replace_budget_entries_uses_batch_insert() -> None:
@@ -51,3 +56,22 @@ def test_replace_budget_entries_uses_batch_insert() -> None:
     assert "INSERT INTO budget_entries" in insert_query
     assert insert_query.count("(%s, %s") == 2
     assert len(insert_params) == 30
+
+
+def test_budget_entries_keeps_insert_order_inside_day() -> None:
+    storage = Storage.__new__(Storage)
+    connection = FakeConnection()
+
+    @contextmanager
+    def connect() -> Iterator[FakeConnection]:
+        yield connection
+
+    storage._connect = connect
+    storage.budget_entries(
+        start_date="2026-08-15",
+        end_date="2026-08-15",
+        operation_type=OperationType.EXPENSE,
+    )
+
+    query, _params = connection.calls[0]
+    assert "ORDER BY operation_date DESC, id ASC" in query

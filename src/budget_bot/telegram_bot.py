@@ -1530,9 +1530,8 @@ def _written_operation_summary_lines(operations: Sequence[ParsedOperation], limi
     lines = ["Засчитано:"]
     current_date: Optional[date] = None
     shown = 0
-    sorted_operations = sorted(operations, key=lambda item: (item.date, item.name.casefold()))
-    expense_totals_by_date = _expense_totals_by_date(sorted_operations)
-    for operation in sorted_operations:
+    expense_totals_by_date = _expense_totals_by_date(operations)
+    for operation in operations:
         if shown >= limit:
             remaining = len(operations) - shown
             if remaining > 0:
