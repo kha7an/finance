@@ -257,6 +257,15 @@ class TelegramApiClient:
             return TELEGRAM_POLLING_CONFLICT_SLEEP_SECONDS
         return TELEGRAM_POLLING_ERROR_SLEEP_SECONDS
 
+    def get_updates_request_timeout(self, poll_timeout: int) -> int:
+        return poll_timeout + max(self.timeout, 30)
+
+    def is_getupdates_timeout(self, exc: Exception) -> bool:
+        if not isinstance(exc, TelegramApiError):
+            return False
+        message = str(exc).casefold()
+        return "getupdates" in message and "timed out" in message
+
     def log_update(self, update: Dict[str, Any]) -> None:
         if "callback_query" in update:
             callback = update["callback_query"]

@@ -91,7 +91,7 @@ class TelegramBot:
                 updates = self._api(
                     "getUpdates",
                     {"timeout": poll_timeout, "offset": offset},
-                    timeout=max(self.api_client.timeout, poll_timeout + 5),
+                    timeout=self.api_client.get_updates_request_timeout(poll_timeout),
                 )
                 for update in updates.get("result", []):
                     offset = update["update_id"] + 1
@@ -101,6 +101,12 @@ class TelegramBot:
                 self._send_due_reminders()
                 time.sleep(0.5)
             except Exception as exc:
+                if self.api_client.is_getupdates_timeout(exc):
+                    logger.warning(
+                        "telegram getUpdates timeout, retrying",
+                        extra=log_extra(status="timeout"),
+                    )
+                    continue
                 logger.exception("telegram polling error")
                 time.sleep(self._polling_error_sleep_seconds(exc))
 
