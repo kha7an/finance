@@ -108,3 +108,45 @@ def test_processor_ignores_existing_entry_with_transliterated_name() -> None:
     assert result.decisions[0].reason == "duplicate"
     assert [entry.operation.name for entry in storage.budget_entries] == ["Yandex Fasten"]
     assert storage.entry_range == (date(2026, 8, 15), date(2026, 8, 15))
+
+
+def test_processor_keeps_operation_above_first_date_header_pending() -> None:
+    storage = FakeStorage()
+    processor = ScreenshotProcessor(storage, storage.category_book())
+    parsed = ParsedScreenshot.from_json(
+        {
+            "bank": "tbank",
+            "period": {"month": 8, "year": 2026, "screenshot_date": "2026-08-24"},
+            "operations": [
+                {
+                    "date": None,
+                    "date_status": "missing",
+                    "name": "Yandex Fasten",
+                    "amount": -155,
+                    "type": "expense",
+                    "category": "Транспорт",
+                    "subcategory": "Такси",
+                    "needs_review": False,
+                },
+                {
+                    "date": "2026-08-24",
+                    "date_status": "relative",
+                    "name": "IP Hakimov F.D",
+                    "amount": -621.77,
+                    "type": "expense",
+                    "category": "Еда",
+                    "subcategory": "Фастфуд",
+                    "needs_review": False,
+                },
+            ],
+        }
+    )
+
+    result = processor.process(b"image-24-aug", parsed)
+
+    assert [decision.status for decision in result.decisions] == [
+        OperationStatus.PENDING,
+        OperationStatus.AUTO_WRITTEN,
+    ]
+    assert result.decisions[0].reason == "operation date missing"
+    assert [entry.operation.name for entry in storage.budget_entries] == ["IP Hakimov F.D"]

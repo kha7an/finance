@@ -139,16 +139,7 @@ def _fill_missing_dates_from_visible_operations(operations: List[ParsedOperation
             continue
         filled_operations.append(_with_date(operation, current_visible_date))
 
-    visible_dates = sorted({operation.date for operation in filled_operations if not operation.date_missing})
-    if len(visible_dates) != 1:
-        return filled_operations
-    visible_date = visible_dates[0]
-    return [
-        _with_date(operation, visible_date)
-        if operation.date_missing
-        else operation
-        for operation in filled_operations
-    ]
+    return filled_operations
 
 
 def _with_date(operation: ParsedOperation, operation_date: date) -> ParsedOperation:
