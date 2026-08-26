@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 import mimetypes
+import threading
 import time
+from collections import defaultdict
 from datetime import date, datetime, time as local_time, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import requests
-
 from .app_factory import AppContext
 from .excel_exporter import ExcelExporter
 from .excel_writer import EXPENSE_SHEET, INCOME_SHEET
+from .log_config import get_logger, log_extra
 from .models import OperationStatus, OperationType, ParsedOperation
+from .parse_worker import ParseJobWorker
 from .storage import image_hash, operation_from_json, telegram_owner_id
+from .storage.facade import BudgetEntryInsert
+from .telegram_api import (
+    TELEGRAM_POLLING_CONFLICT_SLEEP_SECONDS,
+    TELEGRAM_POLLING_ERROR_SLEEP_SECONDS,
+    TelegramApiClient,
+    TelegramApiError,
+)
 from .telegram_common import (
     button_rows as _button_rows,
     format_money as _format_money,
@@ -21,25 +30,24 @@ from .telegram_common import (
     parse_index as _parse_index,
     parse_user_operation_date as _parse_user_operation_date,
 )
-from .telegram_entries import ENTRY_ACTIONS, TelegramEntryEditor, expense_report_keyboard, is_entry_edit_pending
+from .telegram_entries import ENTRY_ACTIONS, TelegramEntryEditor, expense_report_keyboard, is_entry_edit_pending, is_entry_search_pending
 from .telegram_manual import (
     MANUAL_ACTIONS,
     TelegramManualEntry,
     is_manual_pending,
     parse_manual_operation_text as _parse_manual_operation_text,
 )
+from .telegram_reports import expense_report_lines as _expense_report_lines
+from .telegram_reports import parse_stats_period as _parse_stats_period
+from .telegram_reports import chart_period_payload as _chart_period_payload
+from .telegram_reports import parse_chart_period_payload as _parse_chart_period_payload
+from .telegram_charts import render_expense_chart
 
+
+logger = get_logger(__name__)
 
 MEDIA_GROUP_SETTLE_SECONDS = 2.0
 REMINDER_CHECK_SECONDS = 60.0 * 60
-TELEGRAM_POLLING_ERROR_SLEEP_SECONDS = 5.0
-TELEGRAM_POLLING_CONFLICT_SLEEP_SECONDS = 60.0
-
-
-class TelegramApiError(RuntimeError):
-    def __init__(self, message: str, status_code: Optional[int] = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
 
 
 class TelegramBot:
@@ -50,31 +58,30 @@ class TelegramBot:
             raise ValueError("TELEGRAM_ALLOWED_USER_IDS is required, or set TELEGRAM_ALLOW_ALL=true")
         self.context = context
         self.token = context.settings.telegram_bot_token
-        self.base_url = f"{context.settings.telegram_api_base_url}/bot{self.token}"
-        self.file_base_url = f"{context.settings.telegram_file_base_url}/bot{self.token}"
-        self.session = requests.Session()
-        self.timeout = context.settings.telegram_timeout_seconds
         self._last_reminder_check = 0.0
-        self.session.trust_env = context.settings.use_env_proxy and not context.settings.telegram_proxy_url
-        if context.settings.telegram_proxy_url:
-            self.session.proxies.update(
-                {
-                    "http": context.settings.telegram_proxy_url,
-                    "https": context.settings.telegram_proxy_url,
-                }
-            )
+        self.api_client = TelegramApiClient(self)
         self.media_groups: Dict[str, Dict[str, Any]] = {}
+        self.parse_jobs = ParseJobWorker(self)
+        self._parse_worker_stop = threading.Event()
+        self._parse_worker_thread: Optional[threading.Thread] = None
+        self._preview_summary_messages: Dict[str, tuple[int, int]] = {}
+
+    @property
+    def timeout(self) -> int:
+        return self.api_client.timeout
 
     def run_polling(self) -> None:
         while True:
             try:
                 me = self.check_connection()
                 username = me.get("username") or me.get("first_name") or me.get("id")
+                logger.info("telegram polling started for @%s", username)
                 print(f"Telegram polling started for @{username}. Press Ctrl+C to stop.", flush=True)
                 self._api("deleteWebhook", {"drop_pending_updates": False})
+                self._start_parse_worker()
                 break
             except Exception as exc:
-                print(f"Telegram polling startup error: {exc}", flush=True)
+                logger.exception("telegram polling startup error")
                 time.sleep(self._polling_error_sleep_seconds(exc))
 
         offset: Optional[int] = None
@@ -84,7 +91,7 @@ class TelegramBot:
                 updates = self._api(
                     "getUpdates",
                     {"timeout": poll_timeout, "offset": offset},
-                    timeout=max(self.timeout, poll_timeout + 5),
+                    timeout=max(self.api_client.timeout, poll_timeout + 5),
                 )
                 for update in updates.get("result", []):
                     offset = update["update_id"] + 1
@@ -94,8 +101,25 @@ class TelegramBot:
                 self._send_due_reminders()
                 time.sleep(0.5)
             except Exception as exc:
-                print(f"Telegram polling error: {exc}", flush=True)
+                logger.exception("telegram polling error")
                 time.sleep(self._polling_error_sleep_seconds(exc))
+
+    def _start_parse_worker(self) -> None:
+        if self._parse_worker_thread and self._parse_worker_thread.is_alive():
+            return
+
+        def run() -> None:
+            while not self._parse_worker_stop.is_set():
+                try:
+                    processed = self.parse_jobs.process_next_job()
+                    if not processed:
+                        self._parse_worker_stop.wait(1.0)
+                except Exception:
+                    logger.exception("parse worker loop error")
+                    self._parse_worker_stop.wait(5.0)
+
+        self._parse_worker_thread = threading.Thread(target=run, name="parse-job-worker", daemon=True)
+        self._parse_worker_thread.start()
 
     def check_connection(self) -> Dict[str, Any]:
         return self._api("getMe", {})["result"]
@@ -115,7 +139,10 @@ class TelegramBot:
         chat_id = message["chat"]["id"]
         user_id = message.get("from", {}).get("id")
         if not self._is_allowed(user_id):
-            print(f"Rejected Telegram user_id={user_id}; allowed={sorted(self.context.settings.telegram_allowed_user_ids)}", flush=True)
+            logger.warning(
+                "telegram user rejected",
+                extra=log_extra(chat_id=chat_id, user_id=user_id, status="rejected"),
+            )
             self._send_message(chat_id, "Этот бот принимает сообщения только от владельца.")
             return
         self.context.storage.register_telegram_chat(
@@ -142,35 +169,20 @@ class TelegramBot:
         photo = message["photo"][-1]
         file_id = photo["file_id"]
         try:
-            started_at = time.monotonic()
-            print(f"Telegram photo: downloading file_id={file_id}", flush=True)
-            content, mime_type = self._download_file(file_id)
-            download_elapsed = time.monotonic() - started_at
-            saved_path = self._save_image_for_replay(content, mime_type)
-            print(
-                f"Telegram photo: downloaded {len(content)} bytes as {mime_type}; "
-                f"saved {saved_path}; download_elapsed={download_elapsed:.2f}s; parsing",
-                flush=True,
+            job_id = self.parse_jobs.enqueue_single(chat_id, file_id, date.today())
+            logger.info(
+                "parse job queued",
+                extra=log_extra(
+                    owner_id=self.context.owner_id,
+                    chat_id=chat_id,
+                    job_id=job_id,
+                    status="queued",
+                ),
             )
-            result = self.context.parse_and_process(
-                image_content=content,
-                mime_type=mime_type,
-                screenshot_date=date.today(),
-                telegram_file_id=file_id,
-            )
+            self._send_message(chat_id, "Обрабатываю скрин...")
         except Exception as exc:
-            print(f"Telegram photo error: {exc}", flush=True)
-            self._send_message(chat_id, f"Не смог обработать скрин: {exc}")
-            return
-
-        print(
-            f"Telegram photo: processed {len(result.decisions)} decisions "
-            f"elapsed={time.monotonic() - started_at:.2f}s",
-            flush=True,
-        )
-        send_started_at = time.monotonic()
-        self._send_processing_result(chat_id, result)
-        print(f"Telegram photo: response sent elapsed={time.monotonic() - send_started_at:.2f}s", flush=True)
+            logger.exception("telegram photo enqueue error", extra=log_extra(chat_id=chat_id))
+            self._send_message(chat_id, f"Не смог поставить скрин в очередь: {exc}")
 
     def _queue_media_group_photo(self, message: Dict[str, Any]) -> None:
         chat_id = message["chat"]["id"]
@@ -188,10 +200,13 @@ class TelegramBot:
         )
         group["messages"].append(message)
         group["updated_at"] = time.monotonic()
-        print(
-            f"Telegram album: queued media_group_id={media_group_id} "
-            f"count={len(group['messages'])}",
-            flush=True,
+        logger.info(
+            "telegram album queued",
+            extra=log_extra(
+                chat_id=chat_id,
+                media_group_id=media_group_id,
+                status="queued",
+            ),
         )
 
     def _flush_ready_media_groups(self) -> None:
@@ -214,41 +229,26 @@ class TelegramBot:
         chat_id = int(group["chat_id"])
         media_group_id = str(group["media_group_id"])
         messages = list(group["messages"])
-        images: List[tuple[bytes, str]] = []
+        file_ids = [message["photo"][-1]["file_id"] for message in messages]
         try:
-            started_at = time.monotonic()
-            for message in messages:
-                download_started_at = time.monotonic()
-                photo = message["photo"][-1]
-                file_id = photo["file_id"]
-                print(f"Telegram album: downloading file_id={file_id}", flush=True)
-                content, mime_type = self._download_file(file_id)
-                saved_path = self._save_image_for_replay(content, mime_type)
-                images.append((content, mime_type))
-                print(
-                    f"Telegram album: downloaded {len(content)} bytes as {mime_type}; "
-                    f"saved {saved_path}; download_elapsed={time.monotonic() - download_started_at:.2f}s",
-                    flush=True,
-                )
-            result = self.context.parse_and_process_many(
-                images=images,
-                screenshot_date=date.today(),
-                telegram_file_id=f"media_group:{media_group_id}",
+            job_id = self.parse_jobs.enqueue_album(chat_id, file_ids, media_group_id, date.today())
+            logger.info(
+                "parse album job queued",
+                extra=log_extra(
+                    owner_id=self.context.owner_id,
+                    chat_id=chat_id,
+                    media_group_id=media_group_id,
+                    job_id=job_id,
+                    status="queued",
+                ),
             )
+            self._send_message(chat_id, f"Обрабатываю альбом из {len(file_ids)} скринов...")
         except Exception as exc:
-            print(f"Telegram album error: {exc}", flush=True)
-            self._send_message(chat_id, f"Не смог обработать альбом скринов: {exc}")
-            return
-
-        print(
-            f"Telegram album: processed media_group_id={media_group_id} "
-            f"photos={len(images)} decisions={len(result.decisions)} "
-            f"elapsed={time.monotonic() - started_at:.2f}s",
-            flush=True,
-        )
-        send_started_at = time.monotonic()
-        self._send_processing_result(chat_id, result)
-        print(f"Telegram album: response sent elapsed={time.monotonic() - send_started_at:.2f}s", flush=True)
+            logger.exception(
+                "telegram album enqueue error",
+                extra=log_extra(chat_id=chat_id, media_group_id=media_group_id),
+            )
+            self._send_message(chat_id, f"Не смог поставить альбом в очередь: {exc}")
 
     def _handle_callback(self, callback: Dict[str, Any]) -> None:
         chat_id = callback["message"]["chat"]["id"]
@@ -269,7 +269,7 @@ class TelegramBot:
         if action in ENTRY_ACTIONS:
             self._entry_editor().handle_callback(callback, chat_id, action, payload)
             return
-        if action in {"menu", "stats", "statscat", "sync", "analytics"}:
+        if action in {"menu", "stats", "statscat", "sync", "analytics", "chart"}:
             self._handle_stats_callback(callback, chat_id, action, payload)
             return
         if action in MANUAL_ACTIONS:
@@ -453,10 +453,10 @@ class TelegramBot:
 
         today = date.today()
         message_id = message.get("message_id")
-        if text in {"+ Расход", "Добавить расход"}:
+        if text in {"Расход", "+ Расход", "Добавить расход"}:
             self._start_manual_entry(chat_id, OperationType.EXPENSE, message_id=message_id)
             return
-        if text in {"+ Доход", "Добавить доход"}:
+        if text in {"Доход", "+ Доход", "Добавить доход"}:
             self._start_manual_entry(chat_id, OperationType.INCOME, message_id=message_id)
             return
         pending = self.context.storage.latest_pending_for_chat(chat_id)
@@ -465,6 +465,9 @@ class TelegramBot:
             return
         if pending is not None and is_entry_edit_pending(pending):
             self._entry_editor().handle_edit_text(chat_id, text, pending, message_id=message_id)
+            return
+        if pending is not None and is_entry_search_pending(pending):
+            self._entry_editor().handle_search_text(chat_id, text, pending, message_id=message_id)
             return
         if text == "Аналитика":
             self._send_analytics_menu(chat_id)
@@ -599,7 +602,6 @@ class TelegramBot:
         if count is None or count < 0 or count > operation.occurrence_count:
             self._send_quantity_picker(chat_id, operation_hash, operation)
             return
-        self._delete_pending_action_message(chat_id, operation_hash)
         if count == 0:
             image_hash_value = row["image_hash"]
             self.context.storage.update_operation_status(
@@ -708,22 +710,19 @@ class TelegramBot:
         bank: str,
         source: str = "bot",
     ) -> tuple[int, int]:
-        first_row: Optional[int] = None
-        last_row: Optional[int] = None
-        for index in range(operation.occurrence_count):
-            entry_hash = operation_hash if index == 0 else f"{operation_hash}:{index + 1}"
-            entry_id = self.context.storage.append_budget_entry(
+        if operation.occurrence_count <= 0:
+            raise RuntimeError("Cannot write zero operations")
+        entries = [
+            BudgetEntryInsert(
                 source=source,
-                operation_hash=entry_hash,
+                operation_hash=operation_hash if index == 0 else f"{operation_hash}:{index + 1}",
                 operation=operation,
                 bank=bank,
             )
-            if first_row is None:
-                first_row = entry_id
-            last_row = entry_id
-        if first_row is None or last_row is None:
-            raise RuntimeError("Cannot write zero operations")
-        return first_row, last_row
+            for index in range(operation.occurrence_count)
+        ]
+        entry_ids = self.context.storage.append_budget_entries_batch(entries)
+        return entry_ids[0], entry_ids[-1]
 
     def _append_operation_copies(self, operation: ParsedOperation, bank: str) -> tuple[int, int]:
         from .storage import operation_hash
@@ -875,6 +874,30 @@ class TelegramBot:
             category, _subcategories = category_item
             self._send_expense_report(chat_id, today.replace(day=1), today, category=category)
             return
+        if action == "chart":
+            if payload == "today":
+                self._send_expense_chart(chat_id, today, today)
+                return
+            if payload == "week":
+                self._send_expense_chart(chat_id, today - timedelta(days=today.weekday()), today)
+                return
+            if payload in {"month", ""}:
+                self._send_expense_chart(chat_id, today.replace(day=1), today)
+                return
+            if payload == "period":
+                self._send_message(
+                    chat_id,
+                    "Напиши период для диаграммы: 01.08 или 01.08-24.08",
+                    reply_markup=self._main_reply_keyboard(),
+                )
+                return
+            period = _parse_chart_period_payload(payload)
+            if period is None:
+                self._send_message(chat_id, "Период устарел. Открой аналитику заново.", reply_markup=self._main_reply_keyboard())
+                return
+            start_date, end_date, category = period
+            self._send_expense_chart(chat_id, start_date, end_date, category=category)
+            return
 
     def _handle_stats_text(self, chat_id: int, text: str) -> None:
         parts = text.split(maxsplit=1)
@@ -936,6 +959,37 @@ class TelegramBot:
         summary = self.context.storage.expense_summary(start_date, end_date, category=category)
         self._send_message(chat_id, "\n".join(_expense_report_lines(summary)), reply_markup=expense_report_keyboard(start_date, end_date, category))
 
+    def _send_expense_chart(
+        self,
+        chat_id: int,
+        start_date: date,
+        end_date: date,
+        category: Optional[str] = None,
+    ) -> None:
+        summary = self.context.storage.expense_summary(start_date, end_date, category=category)
+        if summary["count"] == 0:
+            self._send_message(
+                chat_id,
+                "За этот период расходов нет — нечего рисовать.",
+                reply_markup=expense_report_keyboard(start_date, end_date, category),
+            )
+            return
+        daily_rows = self.context.storage.expense_daily_totals(start_date, end_date, category=category)
+        chart_dir = self.context.settings.export_dir / "charts"
+        chart_name = _chart_period_payload(start_date, end_date, category).replace(":", "-")
+        chart_path = chart_dir / f"{self.context.owner_id}-{chart_name}.png"
+        try:
+            render_expense_chart(summary, daily_rows, chart_path)
+        except Exception as exc:
+            logger.exception("expense chart render failed", extra=log_extra(chat_id=chat_id))
+            self._send_message(chat_id, f"Не смог построить диаграмму: {exc}", reply_markup=self._main_reply_keyboard())
+            return
+        caption = f"Расходы {start_date.strftime('%d.%m')} – {end_date.strftime('%d.%m')}"
+        if category:
+            caption = f"{caption}: {category}"
+        if not self._send_photo(chat_id, chart_path, caption=caption):
+            self._send_message(chat_id, "Не смог отправить диаграмму.", reply_markup=self._main_reply_keyboard())
+
     def _entry_editor(self) -> TelegramEntryEditor:
         editor = getattr(self, "_telegram_entry_editor", None)
         if editor is None:
@@ -977,6 +1031,9 @@ class TelegramBot:
                         {"text": "Категории", "callback_data": "stats:cats"},
                         {"text": "Даты", "callback_data": "stats:period"},
                     ],
+                    [
+                        {"text": "Диаграмма", "callback_data": "chart:month"},
+                    ],
                 ]
             },
         )
@@ -986,6 +1043,7 @@ class TelegramBot:
         if now_monotonic - self._last_reminder_check < REMINDER_CHECK_SECONDS:
             return
         self._last_reminder_check = now_monotonic
+        due_by_date: Dict[date, List[int]] = defaultdict(list)
         for settings in self.context.storage.reminder_settings():
             if not settings["enabled"]:
                 continue
@@ -997,16 +1055,23 @@ class TelegramBot:
             reminder_time = _parse_reminder_time(str(settings["time_local"]))
             if reminder_time is None or now_local.time() < reminder_time:
                 continue
-            chat_id = int(settings["chat_id"])
-            reminder_date = now_local.date()
-            if self.context.storage.reminder_sent(chat_id, reminder_date):
-                continue
-            self._send_message(
-                chat_id,
-                "Не забудь отправить скриншоты расходов за сегодня.",
-                reply_markup=self._main_reply_keyboard(),
-            )
-            self.context.storage.mark_reminder_sent(chat_id, reminder_date)
+            due_by_date[now_local.date()].append(int(settings["chat_id"]))
+
+        delivered: List[tuple[int, date]] = []
+        for reminder_date, chat_ids in due_by_date.items():
+            already_sent = self.context.storage.reminder_sent_chat_ids(chat_ids, reminder_date)
+            for chat_id in chat_ids:
+                if chat_id in already_sent:
+                    continue
+                self._send_message(
+                    chat_id,
+                    "Не забудь отправить скриншоты расходов за сегодня.",
+                    reply_markup=self._main_reply_keyboard(),
+                )
+                delivered.append((chat_id, reminder_date))
+
+        if delivered:
+            self.context.storage.mark_reminders_sent(delivered)
 
     def _send_reset_confirmation(self, chat_id: int) -> None:
         self._send_message(
@@ -1025,7 +1090,7 @@ class TelegramBot:
     def _main_reply_keyboard(self) -> Dict[str, Any]:
         return {
             "keyboard": [
-                [{"text": "+ Расход"}, {"text": "+ Доход"}],
+                [{"text": "Расход"}, {"text": "Доход"}],
                 [{"text": "Аналитика"}, {"text": "Синхронизировать"}, {"text": "Сброс"}],
             ],
             "resize_keyboard": True,
@@ -1060,15 +1125,19 @@ class TelegramBot:
     def _delete_message(self, chat_id: int, message_id: int) -> None:
         try:
             self._api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
-        except RuntimeError as exc:
-            print(f"Telegram delete message ignored: {exc}", flush=True)
+        except TelegramApiError as exc:
+            if exc.status_code == 400:
+                return
+            logger.warning("telegram delete message ignored: %s", exc, extra=log_extra(chat_id=chat_id))
             self._clear_callback_buttons(chat_id, message_id)
 
     def _clear_callback_buttons(self, chat_id: int, message_id: int) -> None:
         try:
             self._api("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message_id})
-        except RuntimeError as exc:
-            print(f"Telegram clear buttons ignored: {exc}", flush=True)
+        except TelegramApiError as exc:
+            if exc.status_code == 400:
+                return
+            logger.warning("telegram clear buttons ignored: %s", exc, extra=log_extra(chat_id=chat_id))
 
     def _send_category_picker(self, chat_id: int, operation_hash: str) -> None:
         self._send_message(
@@ -1235,7 +1304,9 @@ class TelegramBot:
         ignored = [item for item in result.decisions if item.status == OperationStatus.IGNORED]
 
         if written:
-            self._send_message(chat_id, "\n".join(_written_summary_lines(written)))
+            message_id = self._send_message(chat_id, "\n".join(_written_summary_lines(written)))
+            if pending and message_id is not None:
+                self._preview_summary_messages[result.image_hash] = (chat_id, message_id)
         elif ignored and not pending:
             self._send_message(chat_id, "Ничего нового не записал.")
         elif pending:
@@ -1284,6 +1355,12 @@ class TelegramBot:
         has_pending = any(row["status"] == OperationStatus.PENDING.value for row in rows)
         if has_pending:
             return
+
+        preview = self._preview_summary_messages.pop(image_hash_value, None)
+        if preview is not None:
+            preview_chat_id, preview_message_id = preview
+            self._delete_message(preview_chat_id, preview_message_id)
+
         written_operations = [
             operation_from_json(row["operation_json"])
             for row in rows
@@ -1300,15 +1377,7 @@ class TelegramBot:
         return operation_hash(bank, operation)
 
     def _download_file(self, file_id: str) -> tuple[bytes, str]:
-        file_info = self._api("getFile", {"file_id": file_id})["result"]
-        file_path = file_info["file_path"]
-        try:
-            response = self.session.get(f"{self.file_base_url}/{file_path}", timeout=self.timeout)
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise RuntimeError(self._sanitize_error(f"Telegram file download failed: {exc}")) from None
-        mime_type = mimetypes.guess_type(file_path)[0] or "image/jpeg"
-        return response.content, mime_type
+        return self.api_client.download_file(file_id)
 
     def _save_image_for_replay(self, content: bytes, mime_type: str) -> Path:
         suffix = mimetypes.guess_extension(mime_type) or ".jpg"
@@ -1320,25 +1389,10 @@ class TelegramBot:
         return path
 
     def _api(self, method: str, payload: Dict[str, Any], timeout: Optional[int] = None) -> Dict[str, Any]:
-        response: Optional[requests.Response] = None
-        try:
-            response = self.session.post(f"{self.base_url}/{method}", json=payload, timeout=timeout or self.timeout)
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            status_code = response.status_code if response is not None else None
-            raise TelegramApiError(
-                self._sanitize_error(f"Telegram API {method} failed: {exc}"),
-                status_code=status_code,
-            ) from None
-        data = response.json()
-        if not data.get("ok"):
-            raise TelegramApiError(self._sanitize_error(str(data)), status_code=data.get("error_code"))
-        return data
+        return self.api_client.api(method, payload, timeout=timeout)
 
     def _polling_error_sleep_seconds(self, exc: Exception) -> float:
-        if isinstance(exc, TelegramApiError) and exc.status_code == 409:
-            return TELEGRAM_POLLING_CONFLICT_SLEEP_SECONDS
-        return TELEGRAM_POLLING_ERROR_SLEEP_SECONDS
+        return self.api_client.polling_error_sleep_seconds(exc)
 
     def _send_message(
         self,
@@ -1355,20 +1409,10 @@ class TelegramBot:
         return int(message_id) if message_id is not None else None
 
     def _send_document(self, chat_id: int, path: Path) -> bool:
-        try:
-            with path.open("rb") as handle:
-                response = self.session.post(
-                    f"{self.base_url}/sendDocument",
-                    data={"chat_id": chat_id},
-                    files={"document": (path.name, handle, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-                    timeout=self.timeout,
-                )
-            response.raise_for_status()
-            data = response.json()
-            return bool(data.get("ok"))
-        except Exception as exc:
-            print(f"Telegram send document ignored: {exc}", flush=True)
-            return False
+        return self.api_client.send_document(chat_id, path)
+
+    def _send_photo(self, chat_id: int, path: Path, caption: Optional[str] = None) -> bool:
+        return self.api_client.send_photo(chat_id, path, caption=caption)
 
     def _answer_callback(self, callback_id: str, text: str) -> None:
         self._api("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
@@ -1383,14 +1427,18 @@ class TelegramBot:
         message = update.get("message") or update.get("callback_query", {}).get("message")
         user = update.get("message", {}).get("from") or update.get("callback_query", {}).get("from") or {}
         if not message:
-            print(f"Telegram update {update.get('update_id')}: non-message", flush=True)
+            logger.info("telegram update without message", extra=log_extra(status="ignored"))
             return
         kinds = [kind for kind in ("text", "photo", "document") if kind in message]
-        print(
-            f"Telegram update {update.get('update_id')}: "
-            f"user_id={user.get('id')} chat_id={message.get('chat', {}).get('id')} "
-            f"kinds={','.join(kinds) or 'other'}",
-            flush=True,
+        logger.info(
+            "telegram update",
+            extra=log_extra(
+                chat_id=message.get("chat", {}).get("id"),
+                user_id=user.get("id"),
+                status="update",
+                update_id=update.get("update_id"),
+                kinds=",".join(kinds) or "other",
+            ),
         )
 
     def _sanitize_error(self, text: str) -> str:
@@ -1402,23 +1450,6 @@ def _parse_category_pair(text: str) -> tuple[Optional[str], Optional[str]]:
         return None, None
     category, subcategory = text.split("/", 1)
     return category.strip(), subcategory.strip()
-
-
-def _parse_stats_period(text: str, year: int) -> Optional[tuple[date, date]]:
-    cleaned = text.strip().replace(" ", "")
-    if "-" not in cleaned:
-        single_date = _parse_user_operation_date(cleaned, year)
-        if single_date is None:
-            return None
-        return single_date, single_date
-    start_text, end_text = cleaned.split("-", 1)
-    start_date = _parse_user_operation_date(start_text, year)
-    end_date = _parse_user_operation_date(end_text, year)
-    if start_date is None or end_date is None:
-        return None
-    if end_date < start_date:
-        return end_date, start_date
-    return start_date, end_date
 
 
 def _parse_reminder_time(text: str) -> Optional[local_time]:
@@ -1512,28 +1543,6 @@ def _written_operation_summary_lines(operations: Sequence[ParsedOperation], limi
 
         lines.append(f"- {_operation_summary_text(operation)}")
         shown += 1
-    return lines
-
-
-def _expense_report_lines(summary: Dict[str, Any]) -> List[str]:
-    start_date = summary["start_date"]
-    end_date = summary["end_date"]
-    category = summary.get("category")
-    title = f"Расходы {start_date.strftime('%d.%m')} - {end_date.strftime('%d.%m')}"
-    if category:
-        title = f"{title}: {category}"
-    lines = [
-        title,
-        f"Всего: {_format_money(summary['total'])}",
-        f"Операций: {summary['count']}",
-    ]
-
-    groups = summary["subcategories"] if category else summary["categories"]
-    if groups:
-        lines.append("Топ:")
-        for row in groups[:5]:
-            name = row.get("subcategory") if category else row.get("category")
-            lines.append(f"- {name or 'Без категории'}: {_format_money(float(row['total']))}")
     return lines
 
 

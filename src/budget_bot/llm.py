@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import time
 from abc import ABC, abstractmethod
 from datetime import date
 from typing import Any, Dict, List, Tuple
@@ -10,7 +11,11 @@ from typing import Any, Dict, List, Tuple
 import requests
 
 from .categories import CategoryBook
+from .log_config import get_logger, log_extra
 from .models import ParsedScreenshot
+
+
+logger = get_logger(__name__)
 
 
 class VisionClient(ABC):
@@ -112,6 +117,12 @@ class GeminiVisionClient(VisionClient):
                     }
                 }
             )
+        started_at = time.monotonic()
+        total_bytes = sum(len(image_content) for image_content, _mime_type in images)
+        logger.info(
+            "gemini vision request",
+            extra=log_extra(provider="gemini", model=self.model, images=len(images), bytes=total_bytes, status="request"),
+        )
         response = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent",
             params={"key": self.api_key},
@@ -132,6 +143,16 @@ class GeminiVisionClient(VisionClient):
         _raise_for_provider_status(response, provider="Gemini", auth_env="GEMINI_API_KEY")
         text = _extract_gemini_text(response.json())
         payload = parse_json_text(text)
+        logger.info(
+            "gemini vision response",
+            extra=log_extra(
+                provider="gemini",
+                model=self.model,
+                elapsed=time.monotonic() - started_at,
+                operations=len(payload.get("operations", [])),
+                status="ok",
+            ),
+        )
         return ParsedScreenshot.from_json(payload)
 
 
@@ -179,6 +200,18 @@ class OpenAIVisionClient(VisionClient):
                 f"{base64.b64encode(image_content).decode('ascii')}"
             )
             content.append({"type": "input_image", "image_url": data_url, "detail": "high"})
+        started_at = time.monotonic()
+        total_bytes = sum(len(image_content) for image_content, _mime_type in images)
+        logger.info(
+            "openai vision request",
+            extra=log_extra(
+                provider="openai",
+                model=self.model,
+                images=len(images),
+                bytes=total_bytes,
+                status="request",
+            ),
+        )
         response = self.session.post(
             "https://api.openai.com/v1/responses",
             headers={
@@ -206,6 +239,16 @@ class OpenAIVisionClient(VisionClient):
         )
         _raise_for_provider_status(response, provider="OpenAI", auth_env="OPENAI_API_KEY")
         payload = parse_json_text(_extract_openai_text(response.json()))
+        logger.info(
+            "openai vision response",
+            extra=log_extra(
+                provider="openai",
+                model=self.model,
+                elapsed=time.monotonic() - started_at,
+                operations=len(payload.get("operations", [])),
+                status="ok",
+            ),
+        )
         return ParsedScreenshot.from_json(payload)
 
 

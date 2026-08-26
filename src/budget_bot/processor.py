@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .categories import CategoryBook, apply_keyword_rules
 from .models import OperationStatus, OperationType, ParsedOperation, ParsedScreenshot
 from .storage import Storage, image_hash as make_image_hash, operation_hash as make_operation_hash
+from .storage.facade import BudgetEntryInsert, OperationRecord
+from .storage.helpers import merchant_key
 
 
 @dataclass(frozen=True)
@@ -52,34 +54,58 @@ class ScreenshotProcessor:
 
         decisions: List[OperationDecision] = []
         try:
-            for operation in self._group_same_operations(parsed.operations):
-                operation_hash = make_operation_hash(parsed.bank, operation)
+            learned_rules = self.storage.expense_category_rules()
+            grouped_operations = self._group_same_operations(parsed.operations, learned_rules)
+            operation_hashes = [make_operation_hash(parsed.bank, operation) for operation in grouped_operations]
+            existing_hashes = self.storage.existing_operation_hashes(operation_hashes)
 
-                if self.storage.operation_seen(operation_hash):
-                    decision = OperationDecision(operation, OperationStatus.IGNORED, "duplicate")
-                    decisions.append(decision)
+            pending: List[Tuple[ParsedOperation, str, OperationStatus, str, Optional[int]]] = []
+            budget_requests: List[Tuple[int, str, ParsedOperation]] = []
+
+            for operation, operation_hash in zip(grouped_operations, operation_hashes):
+                if operation_hash in existing_hashes:
+                    decisions.append(OperationDecision(operation, OperationStatus.IGNORED, "duplicate"))
                     continue
 
                 status, reason = self._decide(operation)
-                budget_entry_id: Optional[int] = None
-
+                record_index = len(pending)
+                pending.append((operation, operation_hash, status, reason, None))
                 if status == OperationStatus.AUTO_WRITTEN:
-                    budget_entry_id = self.storage.append_budget_entry(
-                        source="bot",
-                        operation_hash=operation_hash,
-                        operation=operation,
-                        bank=parsed.bank,
-                    )
+                    budget_requests.append((record_index, operation_hash, operation))
 
-                self.storage.record_operation(
-                    operation_hash=operation_hash,
-                    image_hash=image_hash,
-                    bank=parsed.bank,
-                    operation=operation,
-                    status=status,
-                    workbook_row=budget_entry_id,
-                    status_note=reason,
+            if budget_requests:
+                budget_ids = self.storage.append_budget_entries_batch(
+                    [
+                        BudgetEntryInsert(
+                            source="bot",
+                            operation_hash=operation_hash,
+                            operation=operation,
+                            bank=parsed.bank,
+                        )
+                        for _record_index, operation_hash, operation in budget_requests
+                    ]
                 )
+                for (record_index, _operation_hash, _), budget_entry_id in zip(budget_requests, budget_ids):
+                    operation, operation_hash, status, reason, _ = pending[record_index]
+                    pending[record_index] = (operation, operation_hash, status, reason, budget_entry_id)
+
+            if pending:
+                self.storage.record_operations_batch(
+                    [
+                        OperationRecord(
+                            operation_hash=operation_hash,
+                            image_hash=image_hash,
+                            bank=parsed.bank,
+                            operation=operation,
+                            status=status,
+                            workbook_row=budget_entry_id,
+                            status_note=reason,
+                        )
+                        for operation, operation_hash, status, reason, budget_entry_id in pending
+                    ]
+                )
+
+            for operation, operation_hash, status, reason, budget_entry_id in pending:
                 decisions.append(OperationDecision(operation, status, reason, budget_entry_id))
         except Exception:
             self.storage.update_image_status(image_hash, "failed")
@@ -89,10 +115,15 @@ class ScreenshotProcessor:
 
         return ProcessingResult(image_hash=image_hash, bank=parsed.bank, decisions=decisions)
 
-    def _apply_local_rules(self, operation: ParsedOperation) -> ParsedOperation:
+    def _apply_local_rules(
+        self,
+        operation: ParsedOperation,
+        learned_rules: Dict[str, Tuple[str, str]],
+    ) -> ParsedOperation:
         if operation.type != OperationType.EXPENSE:
             return operation
-        mapping = self.storage.get_expense_category_rule(operation.name)
+        key = merchant_key(operation.name)
+        mapping = learned_rules.get(key) if key else None
         if mapping is None:
             mapping = apply_keyword_rules(operation.name, self.category_book)
         if mapping is None:
@@ -156,11 +187,15 @@ class ScreenshotProcessor:
 
         return OperationStatus.AUTO_WRITTEN, "auto written"
 
-    def _group_same_operations(self, operations: List[ParsedOperation]) -> List[ParsedOperation]:
+    def _group_same_operations(
+        self,
+        operations: List[ParsedOperation],
+        learned_rules: Dict[str, Tuple[str, str]],
+    ) -> List[ParsedOperation]:
         grouped: Dict[tuple[str, str, str, str], tuple[ParsedOperation, int]] = {}
         order: List[tuple[str, str, str, str]] = []
         for operation in operations:
-            operation = self._apply_local_rules(operation)
+            operation = self._apply_local_rules(operation, learned_rules)
             key = (
                 operation.date.isoformat(),
                 operation.type.value,

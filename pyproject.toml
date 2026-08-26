@@ -1,7 +1,7 @@
 [project]
 name = "budget-bot"
 version = "0.1.0"
-description = "Local Telegram bot that parses bank screenshots and writes budget operations to Excel."
+description = "Local Telegram bot that parses bank screenshots, stores budget operations in Postgres, and exports Excel on demand."
 requires-python = ">=3.9"
 dependencies = [
   "fastapi==0.115.6",
@@ -10,11 +10,9 @@ dependencies = [
   "PyYAML==6.0.2",
   "requests==2.32.3",
   "python-multipart==0.0.20",
-  "gspread==6.2.1",
   "psycopg[binary,pool]==3.2.10",
+  "alembic==1.14.0",
+  "sqlalchemy==2.0.36",
+  "matplotlib==3.9.4",
   "pytest==8.3.4",
 ]
-
-[tool.pytest.ini_options]
-pythonpath = ["src"]
-testpaths = ["tests"]

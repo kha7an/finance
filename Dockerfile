@@ -13,8 +13,9 @@ RUN apt-get update \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY alembic ./alembic
+COPY alembic.ini ./
 COPY src ./src
-COPY tests ./tests
 COPY pyproject.toml README.md ./
 
 RUN mkdir -p /app/data/exports /app/data/images

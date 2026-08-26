@@ -22,12 +22,14 @@ services:
     environment:
       DATABASE_URL: postgresql://budget_bot:budget_bot@postgres:5432/budget_bot
       BUDGET_EXPORT_DIR: /app/data/exports
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
     volumes:
       - ./data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["python", "-m", "budget_bot.cli", "telegram"]
+    command: ["sh", "-c", "python -m budget_bot.cli migrate && python -m budget_bot.cli telegram"]
     restart: unless-stopped
 
   api:
@@ -47,22 +49,6 @@ services:
         condition: service_healthy
     command: ["uvicorn", "budget_bot.server:app", "--host", "0.0.0.0", "--port", "8000"]
     restart: unless-stopped
-
-  tests:
-    build: .
-    profiles: ["test"]
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgresql://budget_bot:budget_bot@postgres:5432/budget_bot
-      BUDGET_EXPORT_DIR: /app/data/exports
-      LLM_PROVIDER: mock
-    volumes:
-      - ./data:/app/data
-    depends_on:
-      postgres:
-        condition: service_healthy
-    command: ["pytest"]
 
 volumes:
   postgres-data:

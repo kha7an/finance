@@ -6,10 +6,14 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Dict, Iterator
 
-from .config import Settings
+from .config import Settings, validate_llm_settings
 from .llm import VisionClient, build_vision_client
+from .log_config import get_logger, log_extra
 from .processor import ScreenshotProcessor
 from .storage import Storage
+
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -74,10 +78,14 @@ class AppContext:
         telegram_file_id: str | None = None,
     ):
         started_at = time.monotonic()
-        print(
-            f"Parse pipeline: llm start provider={self.settings.llm_provider} "
-            f"bytes={len(image_content)} mime={mime_type}",
-            flush=True,
+        logger.info(
+            "parse pipeline llm start",
+            extra=log_extra(
+                owner_id=self.owner_id,
+                status="llm_start",
+                bytes=len(image_content),
+                mime_type=mime_type,
+            ),
         )
         parsed = self.vision_client.parse_screenshot(
             image_content=image_content,
@@ -86,10 +94,14 @@ class AppContext:
             screenshot_date=screenshot_date,
         )
         llm_elapsed = time.monotonic() - started_at
-        print(
-            f"Parse pipeline: llm done elapsed={llm_elapsed:.2f}s "
-            f"operations={len(parsed.operations)}",
-            flush=True,
+        logger.info(
+            "parse pipeline llm done",
+            extra=log_extra(
+                owner_id=self.owner_id,
+                status="llm_done",
+                elapsed=llm_elapsed,
+                operations=len(parsed.operations),
+            ),
         )
         process_started_at = time.monotonic()
         result = self.processor.process(
@@ -97,10 +109,15 @@ class AppContext:
             parsed=parsed,
             telegram_file_id=telegram_file_id,
         )
-        print(
-            f"Parse pipeline: processor done elapsed={time.monotonic() - process_started_at:.2f}s "
-            f"total={time.monotonic() - started_at:.2f}s {_decision_counts_text(result.decisions)}",
-            flush=True,
+        logger.info(
+            "parse pipeline processor done",
+            extra=log_extra(
+                owner_id=self.owner_id,
+                status="processor_done",
+                elapsed=time.monotonic() - process_started_at,
+                total=time.monotonic() - started_at,
+                decisions=len(result.decisions),
+            ),
         )
         return result
 
@@ -112,10 +129,14 @@ class AppContext:
     ):
         started_at = time.monotonic()
         total_bytes = sum(len(content) for content, _mime_type in images)
-        print(
-            f"Parse pipeline: llm batch start provider={self.settings.llm_provider} "
-            f"images={len(images)} bytes={total_bytes}",
-            flush=True,
+        logger.info(
+            "parse pipeline llm batch start",
+            extra=log_extra(
+                owner_id=self.owner_id,
+                status="llm_batch_start",
+                images=len(images),
+                bytes=total_bytes,
+            ),
         )
         parsed = self.vision_client.parse_screenshots(
             images=images,
@@ -123,10 +144,14 @@ class AppContext:
             screenshot_date=screenshot_date,
         )
         llm_elapsed = time.monotonic() - started_at
-        print(
-            f"Parse pipeline: llm batch done elapsed={llm_elapsed:.2f}s "
-            f"operations={len(parsed.operations)}",
-            flush=True,
+        logger.info(
+            "parse pipeline llm batch done",
+            extra=log_extra(
+                owner_id=self.owner_id,
+                status="llm_batch_done",
+                elapsed=llm_elapsed,
+                operations=len(parsed.operations),
+            ),
         )
         process_started_at = time.monotonic()
         result = self.processor.process(
@@ -134,16 +159,23 @@ class AppContext:
             parsed=parsed,
             telegram_file_id=telegram_file_id,
         )
-        print(
-            f"Parse pipeline: processor done elapsed={time.monotonic() - process_started_at:.2f}s "
-            f"total={time.monotonic() - started_at:.2f}s {_decision_counts_text(result.decisions)}",
-            flush=True,
+        logger.info(
+            "parse pipeline processor done",
+            extra=log_extra(
+                owner_id=self.owner_id,
+                status="processor_done",
+                elapsed=time.monotonic() - process_started_at,
+                total=time.monotonic() - started_at,
+                decisions=len(result.decisions),
+            ),
         )
         return result
 
 
 def build_context() -> AppContext:
-    return AppContext(Settings.from_env())
+    settings = Settings.from_env()
+    validate_llm_settings(settings)
+    return AppContext(settings)
 
 
 def _combined_image_content(images: list[tuple[bytes, str]]) -> bytes:
@@ -153,14 +185,3 @@ def _combined_image_content(images: list[tuple[bytes, str]]) -> bytes:
         chunks.append(str(len(content)).encode("ascii"))
         chunks.append(content)
     return b"\0".join(chunks)
-
-
-def _decision_counts_text(decisions) -> str:
-    counts: Dict[str, int] = {}
-    reasons: Dict[str, int] = {}
-    for decision in decisions:
-        counts[decision.status.value] = counts.get(decision.status.value, 0) + 1
-        reasons[decision.reason] = reasons.get(decision.reason, 0) + 1
-    count_text = ", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "none"
-    reason_text = ", ".join(f"{key}={value}" for key, value in sorted(reasons.items())) or "none"
-    return f"decisions={len(decisions)} statuses=[{count_text}] reasons=[{reason_text}]"

@@ -63,7 +63,6 @@ class Settings:
     gemini_api_key: str
     gemini_model: str
     database_url: str
-    google_credentials_path: Path
     export_dir: Path
     default_timezone: str
     reminder_enabled: bool
@@ -83,7 +82,7 @@ class Settings:
             telegram_proxy_url=_str_env("TELEGRAM_PROXY_URL"),
             telegram_timeout_seconds=_int_env("TELEGRAM_TIMEOUT_SECONDS", 60),
             use_env_proxy=_bool_env("USE_ENV_PROXY", True),
-            llm_provider=os.getenv("LLM_PROVIDER", "mock").strip().lower(),
+            llm_provider=os.getenv("LLM_PROVIDER", "openai").strip().lower(),
             openai_api_key=os.getenv("OPENAI_API_KEY", ""),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             openai_proxy_url=_str_env("OPENAI_PROXY_URL") or _str_env("TELEGRAM_PROXY_URL"),
@@ -91,7 +90,6 @@ class Settings:
             gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
             database_url=os.getenv("DATABASE_URL", "postgresql://budget_bot:budget_bot@127.0.0.1:5433/budget_bot"),
-            google_credentials_path=Path(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "./data/google-service-account.json")).expanduser(),
             export_dir=Path(os.getenv("BUDGET_EXPORT_DIR", "./data/exports")).expanduser(),
             default_timezone=os.getenv("DEFAULT_TIMEZONE", "Europe/Moscow"),
             reminder_enabled=_bool_env("REMINDER_ENABLED", True),
@@ -99,3 +97,18 @@ class Settings:
             api_token=os.getenv("BUDGET_API_TOKEN", ""),
             max_upload_bytes=_int_env("MAX_UPLOAD_BYTES", 10 * 1024 * 1024),
         )
+
+
+def validate_llm_settings(settings: Settings) -> None:
+    provider = settings.llm_provider
+    if provider == "openai":
+        if not settings.openai_api_key.strip():
+            raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
+        return
+    if provider == "gemini":
+        if not settings.gemini_api_key.strip():
+            raise ValueError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
+        return
+    if provider == "mock":
+        return
+    raise ValueError(f"Unsupported LLM_PROVIDER: {provider!r}. Use openai, gemini, or mock.")

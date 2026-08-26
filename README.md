@@ -100,19 +100,8 @@ TELEGRAM_FILE_BASE_URL=http://127.0.0.1:8081/file
 Проверить конфиг и справочник:
 
 ```bash
+docker compose run --rm bot python -m budget_bot.cli migrate
 docker compose run --rm bot python -m budget_bot.cli check
-```
-
-Проверить запись в Postgres без Telegram/LLM:
-
-```bash
-docker compose run --rm bot python -m budget_bot.cli mock-run --tag smoke-1
-```
-
-Полный локальный набор тестов:
-
-```bash
-docker compose --profile test run --rm tests
 ```
 
 Сформировать Excel из Postgres:
@@ -121,9 +110,6 @@ docker compose --profile test run --rm tests
 docker compose run --rm bot python -m budget_bot.cli export-excel --owner default
 docker compose run --rm bot python -m budget_bot.cli export-excel --owner default --period 01.08-24.08
 ```
-
-Команда добавляет моковый расход, а моковый доход и перевод оставляет на ручное
-решение. Повтор с тем же `--tag` должен показать, что скрин уже обработан.
 
 Запустить Telegram long polling:
 

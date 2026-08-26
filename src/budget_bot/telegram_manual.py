@@ -32,7 +32,7 @@ class TelegramManualEntry:
             "stage": "date",
             "cleanup_message_ids": [],
         }
-        label = "расхода" if operation_type == OperationType.EXPENSE else "дохода"
+        label = "расход" if operation_type == OperationType.EXPENSE else "доход"
         self.send_prompt(
             chat_id,
             state,
@@ -60,7 +60,7 @@ class TelegramManualEntry:
         state = manual_state_from_pending(pending)
         if state is None:
             self.bot.context.storage.delete_pending_action(pending["operation_hash"])
-            self.bot._send_message(chat_id, "Старый ручной ввод сбросил. Нажми «+ Расход» или «+ Доход» заново.")
+            self.bot._send_message(chat_id, "Старый ручной ввод сбросил. Нажми «Расход» или «Доход» заново.")
             return
 
         stage = state.get("stage")
@@ -93,7 +93,7 @@ class TelegramManualEntry:
             if operation is None:
                 self.cleanup_messages(chat_id, state)
                 self.bot.context.storage.delete_pending_action(pending["operation_hash"])
-                self.bot._send_message(chat_id, "Не смог собрать операцию. Начни заново через «+ Расход» или «+ Доход».")
+                self.bot._send_message(chat_id, "Не смог собрать операцию. Начни заново через «Расход» или «Доход».")
                 return
             self.cleanup_messages(chat_id, state)
             self.bot.context.storage.delete_pending_action(pending["operation_hash"])

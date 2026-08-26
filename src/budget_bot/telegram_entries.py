@@ -6,9 +6,12 @@ from typing import Any, Dict, Optional
 
 from .models import OperationType, ParsedOperation
 from .telegram_common import button_rows, format_money, operation_summary_text, parse_index, parse_money_amount, parse_user_operation_date
+from .telegram_reports import chart_period_payload
 
 
-ENTRY_ACTIONS = {"entrylist", "entry", "edel", "edelok", "eamt", "edate", "ename", "ecat", "esub", "eback"}
+ENTRY_ACTIONS = {"entrylist", "entryfind", "entry", "edel", "edelok", "eamt", "edate", "ename", "ecat", "esub", "eback"}
+ENTRY_LIST_PAGE_SIZE = 15
+ENTRY_SEARCH_RESULT_LIMIT = 10
 
 
 class TelegramEntryEditor:
@@ -21,10 +24,38 @@ class TelegramEntryEditor:
             if period is None:
                 self.bot._answer_callback(callback["id"], "Период устарел")
                 return
-            start_date, end_date, category = period
+            start_date, end_date, category, page = period
             self.bot._answer_callback(callback["id"], "Показываю записи")
             self.bot._delete_callback_message(callback)
-            self.send_entry_list(chat_id, start_date, end_date, category=category)
+            self.send_entry_list(chat_id, start_date, end_date, category=category, page=page)
+            return
+
+        if action == "entryfind":
+            period = _parse_entrylist_find_payload(payload)
+            if period is None:
+                self.bot._answer_callback(callback["id"], "Период устарел")
+                return
+            start_date, end_date, category = period
+            self.bot.context.storage.add_pending_action(
+                operation_hash=entry_search_pending_hash(chat_id),
+                chat_id=chat_id,
+                message_id=callback["message"].get("message_id"),
+                prompt=entry_search_state_to_prompt(
+                    {
+                        "kind": "entry_search",
+                        "start_date": start_date.isoformat(),
+                        "end_date": end_date.isoformat(),
+                        "category": category,
+                    }
+                ),
+            )
+            self.bot._answer_callback(callback["id"], "Жду текст")
+            self.bot._delete_callback_message(callback)
+            self.bot._send_message(
+                chat_id,
+                "Напиши ID записи или часть названия, например «Пятёрочка» или «42».\n"
+                "Отмена — слово «отмена».",
+            )
             return
 
         entry_id = parse_index(payload, 0)
@@ -160,23 +191,102 @@ class TelegramEntryEditor:
         self.bot.context.storage.delete_pending_action(pending["operation_hash"])
         self.bot._send_message(chat_id, f"Обновлено: {operation_summary_text(operation)}", reply_markup=self.bot._main_reply_keyboard())
 
+    def handle_search_text(
+        self,
+        chat_id: int,
+        text: str,
+        pending: Dict[str, Any],
+        message_id: Optional[int] = None,
+    ) -> None:
+        if message_id is not None:
+            self.bot._delete_message(chat_id, message_id)
+        state = entry_search_state_from_pending(pending)
+        if state is None:
+            self.bot.context.storage.delete_pending_action(pending["operation_hash"])
+            self.bot._send_message(chat_id, "Старый поиск сбросил. Открой список записей заново.")
+            return
+        if text.casefold() in {"отмена", "cancel"}:
+            self.bot.context.storage.delete_pending_action(pending["operation_hash"])
+            self.bot._send_message(chat_id, "Поиск отменён.", reply_markup=self.bot._main_reply_keyboard())
+            return
+        start_date = date.fromisoformat(str(state["start_date"]))
+        end_date = date.fromisoformat(str(state["end_date"]))
+        category = state.get("category")
+        entries = self.bot.context.storage.find_budget_entries(
+            start_date,
+            end_date,
+            text,
+            category=category,
+            limit=ENTRY_SEARCH_RESULT_LIMIT + 1,
+        )
+        self.bot.context.storage.delete_pending_action(pending["operation_hash"])
+        if not entries:
+            self.bot._send_message(
+                chat_id,
+                "Ничего не нашёл. Попробуй ID или другое название.",
+                reply_markup=expense_report_keyboard(start_date, end_date, category=category),
+            )
+            return
+        if len(entries) == 1:
+            self.send_entry_actions(chat_id, entries[0])
+            return
+        truncated = len(entries) > ENTRY_SEARCH_RESULT_LIMIT
+        if truncated:
+            entries = entries[:ENTRY_SEARCH_RESULT_LIMIT]
+            suffix = f"\n\nНайдено больше {ENTRY_SEARCH_RESULT_LIMIT}. Показаны первые {ENTRY_SEARCH_RESULT_LIMIT}. Уточни запрос."
+        else:
+            suffix = ""
+        lines = [f"Нашёл {len(entries)} записей:"]
+        buttons = []
+        for index, entry in enumerate(entries, start=1):
+            lines.append(f"{index}. {entry_summary_text(entry)}")
+            buttons.append({"text": str(index), "callback_data": f"entry:{entry['id']}"})
+        rows = button_rows(buttons, columns=5)
+        rows.append([{"text": "Главное меню", "callback_data": "menu:home"}])
+        self.bot._send_message(chat_id, "\n".join(lines) + suffix, reply_markup={"inline_keyboard": rows})
+
     def send_entry_list(
         self,
         chat_id: int,
         start_date: date,
         end_date: date,
         category: Optional[str] = None,
+        page: int = 1,
     ) -> None:
-        entries = self.bot.context.storage.budget_entries(start_date, end_date, category=category)
-        if not entries:
+        total = self.bot.context.storage.count_budget_entries(start_date, end_date, category=category)
+        if total == 0:
             self.bot._send_message(chat_id, "За этот период записей не нашел.", reply_markup=self.bot._main_reply_keyboard())
             return
-        lines = [f"Записи {start_date.strftime('%d.%m')} - {end_date.strftime('%d.%m')}:"]
+        total_pages = max(1, (total + ENTRY_LIST_PAGE_SIZE - 1) // ENTRY_LIST_PAGE_SIZE)
+        page = min(max(page, 1), total_pages)
+        offset = (page - 1) * ENTRY_LIST_PAGE_SIZE
+        entries = self.bot.context.storage.budget_entries(
+            start_date,
+            end_date,
+            category=category,
+            limit=ENTRY_LIST_PAGE_SIZE,
+            offset=offset,
+        )
+        lines = [
+            f"Записи {start_date.strftime('%d.%m')} - {end_date.strftime('%d.%m')} "
+            f"({page}/{total_pages}, всего {total}):"
+        ]
+        if total > ENTRY_LIST_PAGE_SIZE:
+            lines.append("Листай кнопками или нажми «Найти» и напиши ID / название.")
         buttons = []
-        for index, entry in enumerate(entries, start=1):
+        for index, entry in enumerate(entries, start=offset + 1):
             lines.append(f"{index}. {entry_summary_text(entry)}")
             buttons.append({"text": str(index), "callback_data": f"entry:{entry['id']}"})
         rows = button_rows(buttons, columns=5)
+        nav_row: list[Dict[str, str]] = []
+        list_payload = _entrylist_payload(start_date, end_date, category)
+        if page > 1:
+            nav_row.append({"text": "◀️ Назад", "callback_data": f"entrylist:{list_payload}:{page - 1}"})
+        if page < total_pages:
+            nav_row.append({"text": "Вперёд ▶️", "callback_data": f"entrylist:{list_payload}:{page + 1}"})
+        if nav_row:
+            rows.append(nav_row)
+        rows.append([{"text": "🔍 Найти", "callback_data": f"entryfind:{list_payload}"}])
         rows.append([{"text": "Главное меню", "callback_data": "menu:home"}])
         self.bot._send_message(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": rows})
 
@@ -246,6 +356,10 @@ def entry_edit_pending_hash(chat_id: int) -> str:
     return f"entry-edit-{chat_id}"
 
 
+def entry_search_pending_hash(chat_id: int) -> str:
+    return f"entry-search-{chat_id}"
+
+
 def entry_edit_state_to_prompt(state: Dict[str, Any]) -> str:
     return "entry_edit:" + json.dumps(state, ensure_ascii=False)
 
@@ -267,19 +381,45 @@ def is_entry_edit_pending(pending: Dict[str, Any]) -> bool:
     return entry_edit_state_from_pending(pending) is not None
 
 
+def entry_search_state_to_prompt(state: Dict[str, Any]) -> str:
+    return "entry_search:" + json.dumps(state, ensure_ascii=False)
+
+
+def entry_search_state_from_pending(pending: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if pending is None:
+        return None
+    prompt = str(pending.get("prompt") or "")
+    if not prompt.startswith("entry_search:"):
+        return None
+    try:
+        state = json.loads(prompt.removeprefix("entry_search:"))
+    except json.JSONDecodeError:
+        return None
+    return state if isinstance(state, dict) and state.get("kind") == "entry_search" else None
+
+
+def is_entry_search_pending(pending: Dict[str, Any]) -> bool:
+    return entry_search_state_from_pending(pending) is not None
+
+
 def expense_report_keyboard(start_date: date, end_date: date, category: Optional[str] = None) -> Dict[str, Any]:
-    category_payload = category or "all"
-    payload = f"{start_date.isoformat()}:{end_date.isoformat()}:{category_payload}"
+    payload = chart_period_payload(start_date, end_date, category)
     return {
         "inline_keyboard": [
             [{"text": "Записи", "callback_data": f"entrylist:{payload}"}],
+            [{"text": "Диаграмма", "callback_data": f"chart:{payload}"}],
             [{"text": "Главное меню", "callback_data": "menu:home"}],
         ]
     }
 
 
-def _parse_entrylist_payload(text: str) -> Optional[tuple[date, date, Optional[str]]]:
-    parts = text.split(":", 2)
+def _entrylist_payload(start_date: date, end_date: date, category: Optional[str] = None) -> str:
+    category_payload = category or "all"
+    return f"{start_date.isoformat()}:{end_date.isoformat()}:{category_payload}"
+
+
+def _parse_entrylist_payload(text: str) -> Optional[tuple[date, date, Optional[str], int]]:
+    parts = text.split(":")
     if len(parts) < 2:
         return None
     try:
@@ -287,7 +427,25 @@ def _parse_entrylist_payload(text: str) -> Optional[tuple[date, date, Optional[s
         end_date = date.fromisoformat(parts[1])
     except ValueError:
         return None
-    category = parts[2].strip() if len(parts) == 3 and parts[2].strip() and parts[2] != "all" else None
+    category = None
+    page = 1
+    if len(parts) >= 3:
+        category_part = parts[2].strip()
+        if category_part and category_part != "all":
+            category = category_part
+    if len(parts) >= 4:
+        try:
+            page = max(1, int(parts[3]))
+        except ValueError:
+            page = 1
+    return start_date, end_date, category, page
+
+
+def _parse_entrylist_find_payload(text: str) -> Optional[tuple[date, date, Optional[str]]]:
+    period = _parse_entrylist_payload(text)
+    if period is None:
+        return None
+    start_date, end_date, category, _page = period
     return start_date, end_date, category
 
 
