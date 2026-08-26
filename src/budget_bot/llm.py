@@ -423,7 +423,7 @@ def build_prompt(category_book: CategoryBook, screenshot_date: date, screenshot_
             ),
         ],
         "response_contract": {
-            "bank": "tbank|sber|alfa|unknown",
+            "bank": "tbank|sber|alfa|yapay|unknown",
             "period": {
                 "month": screenshot_date.month,
                 "year": screenshot_date.year,
@@ -522,7 +522,7 @@ def response_schema(category_book: CategoryBook) -> Dict[str, Any]:
         "additionalProperties": False,
         "required": ["bank", "period", "operations"],
         "properties": {
-            "bank": {"type": "string", "enum": ["tbank", "sber", "alfa", "unknown"]},
+            "bank": {"type": "string", "enum": ["tbank", "sber", "alfa", "yapay", "unknown"]},
             "period": {
                 "type": "object",
                 "additionalProperties": False,

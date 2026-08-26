@@ -1432,7 +1432,12 @@ class TelegramBot:
         ignored = [item for item in result.decisions if item.status == OperationStatus.IGNORED]
 
         if written:
-            message_id = self._send_message(chat_id, "\n".join(_written_summary_lines(written)))
+            written_operations = [decision.operation for decision in written]
+            message_id = self._send_message(
+                chat_id,
+                "\n".join(_written_summary_lines(written)),
+                reply_markup=_written_operations_keyboard(written_operations),
+            )
             if pending and message_id is not None:
                 self._preview_summary_messages[result.image_hash] = (chat_id, message_id)
         elif ignored and not pending:
@@ -1495,7 +1500,11 @@ class TelegramBot:
             if row["status"] == OperationStatus.AUTO_WRITTEN.value
         ]
         if written_operations:
-            self._send_message(chat_id, "\n".join(_written_operation_summary_lines(written_operations)))
+            self._send_message(
+                chat_id,
+                "\n".join(_written_operation_summary_lines(written_operations)),
+                reply_markup=_written_operations_keyboard(written_operations),
+            )
         else:
             self._send_message(chat_id, "Ничего не засчитал.")
 
@@ -1687,6 +1696,24 @@ def _written_operation_summary_lines(operations: Sequence[ParsedOperation], limi
         lines.append(f"- {_operation_summary_text(operation)}")
         shown += 1
     return lines
+
+
+def _written_operations_keyboard(operations: Sequence[ParsedOperation]) -> Optional[Dict[str, Any]]:
+    dates = [operation.date for operation in operations]
+    if not dates:
+        return None
+    start_date = min(dates)
+    end_date = max(dates)
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Редактировать записи",
+                    "callback_data": f"entrylist:{_chart_period_payload(start_date, end_date)}",
+                }
+            ]
+        ]
+    }
 
 
 def _expense_totals_by_date(operations: Sequence[ParsedOperation]) -> Dict[date, float]:

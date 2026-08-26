@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from budget_bot.models import OperationType, ParsedOperation
+from budget_bot.models import OperationStatus, OperationType, ParsedOperation
+from budget_bot.processor import OperationDecision, ProcessingResult
 from budget_bot.telegram_bot import TelegramBot, _written_operation_summary_lines
 
 
@@ -117,3 +118,52 @@ def test_stats_range_picker_sends_sorted_period_report() -> None:
 
     assert storage.report_periods == [(date(2026, 8, 1), date(2026, 8, 24), None)]
     assert "Расходы 01.08 - 24.08" in bot.sent_messages[0][1]
+
+
+def test_processing_result_has_edit_entries_button_for_written_period() -> None:
+    bot = _stats_bot(FakeStatsStorage())
+    result = ProcessingResult(
+        image_hash="image-hash",
+        bank="tbank",
+        decisions=[
+            OperationDecision(
+                ParsedOperation(
+                    date=date(2026, 8, 12),
+                    name="Пятёрочка",
+                    amount=-526.87,
+                    type=OperationType.EXPENSE,
+                    category="Еда",
+                    subcategory="Супермаркеты",
+                ),
+                OperationStatus.AUTO_WRITTEN,
+                "auto written",
+            ),
+            OperationDecision(
+                ParsedOperation(
+                    date=date(2026, 8, 5),
+                    name="Такси",
+                    amount=-132,
+                    type=OperationType.EXPENSE,
+                    category="Транспорт",
+                    subcategory="Такси",
+                ),
+                OperationStatus.AUTO_WRITTEN,
+                "auto written",
+            ),
+        ],
+    )
+
+    bot._send_processing_result(123, result)
+
+    _chat_id, text, reply_markup = bot.sent_messages[0]
+    assert "Засчитано:" in text
+    assert reply_markup == {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Редактировать записи",
+                    "callback_data": "entrylist:2026-08-05:2026-08-12:all",
+                }
+            ]
+        ]
+    }

@@ -66,7 +66,7 @@ class ScreenshotProcessor:
             budget_requests: List[Tuple[int, str, ParsedOperation]] = []
 
             for operation, operation_hash in zip(grouped_operations, operation_hashes):
-                if operation_hash in existing_hashes or _matches_existing_entry(operation, existing_entries):
+                if operation_hash in existing_hashes or _matches_existing_entry(parsed.bank, operation, existing_entries):
                     decisions.append(OperationDecision(operation, OperationStatus.IGNORED, "duplicate"))
                     continue
 
@@ -269,11 +269,15 @@ def _is_cashback_or_bonus(operation: ParsedOperation) -> bool:
     return False
 
 
-def _matches_existing_entry(operation: ParsedOperation, entries: List[Dict[str, object]]) -> bool:
+def _matches_existing_entry(bank: str, operation: ParsedOperation, entries: List[Dict[str, object]]) -> bool:
     if operation.date_missing:
         return False
+    normalized_bank = str(bank or "").strip().lower()
     operation_cents = _amount_cents(operation.amount)
     for entry in entries:
+        entry_bank = str(entry.get("bank") or "").strip().lower()
+        if entry_bank and normalized_bank and entry_bank != normalized_bank:
+            continue
         if str(entry.get("operation_date")) != operation.date.isoformat():
             continue
         if str(entry.get("operation_type")) != operation.type.value:

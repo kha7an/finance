@@ -66,6 +66,7 @@ def test_processor_ignores_existing_entry_with_transliterated_name() -> None:
                 "operation_type": "expense",
                 "amount": 141.0,
                 "name": "Яндекс Фастен",
+                "bank": "tbank",
             }
         ]
     )
@@ -108,6 +109,44 @@ def test_processor_ignores_existing_entry_with_transliterated_name() -> None:
     assert result.decisions[0].reason == "duplicate"
     assert [entry.operation.name for entry in storage.budget_entries] == ["Yandex Fasten"]
     assert storage.entry_range == (date(2026, 8, 15), date(2026, 8, 15))
+
+
+def test_processor_allows_same_entry_from_different_bank() -> None:
+    storage = FakeStorage(
+        existing_entries=[
+            {
+                "operation_date": "2026-08-15",
+                "operation_type": "expense",
+                "amount": 141.0,
+                "name": "Яндекс Фастен",
+                "bank": "tbank",
+            }
+        ]
+    )
+    processor = ScreenshotProcessor(storage, storage.category_book())
+    parsed = ParsedScreenshot.from_json(
+        {
+            "bank": "yapay",
+            "period": {"month": 8, "year": 2026, "screenshot_date": "2026-08-16"},
+            "operations": [
+                {
+                    "date": "2026-08-15",
+                    "date_status": "relative",
+                    "name": "Yandex Fasten",
+                    "amount": -141,
+                    "type": "expense",
+                    "category": "Транспорт",
+                    "subcategory": "Такси",
+                    "needs_review": False,
+                },
+            ],
+        }
+    )
+
+    result = processor.process(b"image-yapay-15-aug", parsed)
+
+    assert [decision.status for decision in result.decisions] == [OperationStatus.AUTO_WRITTEN]
+    assert [entry.operation.name for entry in storage.budget_entries] == ["Yandex Fasten"]
 
 
 def test_processor_keeps_operation_above_first_date_header_pending() -> None:
