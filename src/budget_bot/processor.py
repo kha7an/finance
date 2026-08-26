@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from difflib import SequenceMatcher
+import re
 from typing import Dict, List, Optional, Tuple
 
 from .categories import CategoryBook, apply_keyword_rules
@@ -58,12 +60,13 @@ class ScreenshotProcessor:
             grouped_operations = self._group_same_operations(parsed.operations, learned_rules)
             operation_hashes = [make_operation_hash(parsed.bank, operation) for operation in grouped_operations]
             existing_hashes = self.storage.existing_operation_hashes(operation_hashes)
+            existing_entries = self._existing_entries_for_operations(grouped_operations)
 
             pending: List[Tuple[ParsedOperation, str, OperationStatus, str, Optional[int]]] = []
             budget_requests: List[Tuple[int, str, ParsedOperation]] = []
 
             for operation, operation_hash in zip(grouped_operations, operation_hashes):
-                if operation_hash in existing_hashes:
+                if operation_hash in existing_hashes or _matches_existing_entry(operation, existing_entries):
                     decisions.append(OperationDecision(operation, OperationStatus.IGNORED, "duplicate"))
                     continue
 
@@ -232,6 +235,12 @@ class ScreenshotProcessor:
             )
         return result
 
+    def _existing_entries_for_operations(self, operations: List[ParsedOperation]) -> List[Dict[str, object]]:
+        dates = [operation.date for operation in operations if not operation.date_missing]
+        if not dates:
+            return []
+        return self.storage.all_budget_entries(min(dates), max(dates))
+
 
 def _is_cashback_or_bonus(operation: ParsedOperation) -> bool:
     text = " ".join(
@@ -258,6 +267,84 @@ def _is_cashback_or_bonus(operation: ParsedOperation) -> bool:
     if operation.amount > 0 and operation.name.casefold().strip() in {"дебетовая карта", "black"}:
         return True
     return False
+
+
+def _matches_existing_entry(operation: ParsedOperation, entries: List[Dict[str, object]]) -> bool:
+    if operation.date_missing:
+        return False
+    operation_cents = _amount_cents(operation.amount)
+    for entry in entries:
+        if str(entry.get("operation_date")) != operation.date.isoformat():
+            continue
+        if str(entry.get("operation_type")) != operation.type.value:
+            continue
+        if _amount_cents(entry.get("amount")) != operation_cents:
+            continue
+        if _names_similar(operation.name, str(entry.get("name") or "")):
+            return True
+    return False
+
+
+def _amount_cents(value: object) -> int:
+    return int(round(abs(float(value or 0)) * 100))
+
+
+def _names_similar(left: str, right: str) -> bool:
+    left_key = _duplicate_name_key(left)
+    right_key = _duplicate_name_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    shorter, longer = sorted([left_key, right_key], key=len)
+    if len(shorter) >= 5 and shorter in longer:
+        return True
+    return SequenceMatcher(None, left_key, right_key).ratio() >= 0.84
+
+
+_CYRILLIC_TO_LATIN = str.maketrans(
+    {
+        "а": "a",
+        "б": "b",
+        "в": "v",
+        "г": "g",
+        "д": "d",
+        "е": "e",
+        "ё": "e",
+        "ж": "zh",
+        "з": "z",
+        "и": "i",
+        "й": "y",
+        "к": "k",
+        "л": "l",
+        "м": "m",
+        "н": "n",
+        "о": "o",
+        "п": "p",
+        "р": "r",
+        "с": "s",
+        "т": "t",
+        "у": "u",
+        "ф": "f",
+        "х": "h",
+        "ц": "ts",
+        "ч": "ch",
+        "ш": "sh",
+        "щ": "sch",
+        "ъ": "",
+        "ы": "y",
+        "ь": "",
+        "э": "e",
+        "ю": "yu",
+        "я": "ya",
+    }
+)
+
+
+def _duplicate_name_key(name: str) -> str:
+    key = merchant_key(name).replace("ё", "е").translate(_CYRILLIC_TO_LATIN)
+    key = key.replace("yandeks", "yandex")
+    return re.sub(r"[^a-z0-9]+", "", key)
 
 
 def _is_internal_transfer(operation: ParsedOperation) -> bool:
