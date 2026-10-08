@@ -1,0 +1,22 @@
+services:
+  xray:
+    build:
+      context: .
+      dockerfile: docker/xray.Dockerfile
+    environment:
+      XRAY_CONFIG_JSON: ${XRAY_CONFIG_JSON:?Set XRAY_CONFIG_JSON in .env}
+    restart: unless-stopped
+
+  bot:
+    environment:
+      TELEGRAM_PROXY_URL: http://xray:8080
+    depends_on:
+      xray:
+        condition: service_started
+
+  api:
+    environment:
+      TELEGRAM_PROXY_URL: http://xray:8080
+    depends_on:
+      xray:
+        condition: service_started

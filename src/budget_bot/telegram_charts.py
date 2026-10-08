@@ -28,13 +28,17 @@ def render_expense_chart(
     daily_dates, daily_values = _daily_series(start_date, end_date, daily_rows)
     show_daily = len(daily_dates) > 1
 
-    figure_height = 8.5 if show_daily else 5.5
-    figure, axes = plt.subplots(2 if show_daily else 1, 1, figsize=(10, figure_height))
+    figure_height = 9.5 if show_daily else 6.5
+    rows = 3 if show_daily else 2
+    height_ratios = [1.0, 3.8, 2.4] if show_daily else [1.0, 3.8]
+    figure, axes = plt.subplots(rows, 1, figsize=(10, figure_height), gridspec_kw={"height_ratios": height_ratios})
     if not show_daily:
-        pie_axis = axes
+        metric_axis, pie_axis = axes
         bar_axis = None
     else:
-        pie_axis, bar_axis = axes
+        metric_axis, pie_axis, bar_axis = axes
+
+    _render_metrics(metric_axis, summary)
 
     if pie_values:
         pie_axis.pie(
@@ -51,7 +55,11 @@ def render_expense_chart(
         pie_axis.axis("off")
 
     if bar_axis is not None:
+        average = sum(daily_values) / len(daily_values) if daily_values else 0.0
         bar_axis.bar(daily_dates, daily_values, color="#4C78A8", width=0.8)
+        if average > 0:
+            bar_axis.axhline(average, color="#F58518", linestyle="--", linewidth=1.2, label="Среднее")
+            bar_axis.legend(loc="upper left", frameon=False)
         bar_axis.set_title("По дням", fontsize=11)
         bar_axis.set_ylabel("₽")
         bar_axis.yaxis.set_major_formatter(plt.FuncFormatter(_format_axis_money))
@@ -63,6 +71,55 @@ def render_expense_chart(
     figure.savefig(output_path, dpi=120, bbox_inches="tight")
     plt.close(figure)
     return output_path
+
+
+def _render_metrics(axis, summary: Dict[str, Any]) -> None:
+    total = float(summary["total"])
+    count = int(summary["count"] or 0)
+    period_days = int(summary.get("period_days") or 1)
+    previous_total = float(summary.get("previous_total") or 0)
+    previous_delta = float(summary.get("previous_delta") or (total - previous_total))
+    previous_delta_percent = summary.get("previous_delta_percent")
+
+    lines = [
+        f"Всего: {_format_money_text(total)}",
+        f"Операций: {count}",
+    ]
+    if period_days > 1:
+        lines.append(f"Среднее в день: {_format_money_text(total / period_days)}")
+    if count > 0:
+        lines.append(f"Средний чек: {_format_money_text(total / count)}")
+    if previous_total > 0:
+        direction = "+" if previous_delta >= 0 else "-"
+        if previous_delta_percent is None:
+            lines.append(f"К прошлому периоду: {direction}{_format_money_text(abs(previous_delta))}")
+        else:
+            lines.append(
+                f"К прошлому периоду: {direction}{_format_money_text(abs(previous_delta))} "
+                f"({direction}{abs(float(previous_delta_percent)):.0f}%)"
+            )
+    elif total > 0 and summary.get("previous_start_date"):
+        lines.append("К прошлому периоду: раньше расходов не было")
+
+    axis.axis("off")
+    axis.text(0.0, 0.72, "   ".join(lines[:3]), fontsize=11, weight="bold", transform=axis.transAxes)
+    if len(lines) > 3:
+        axis.text(
+            0.0,
+            0.34,
+            "   ".join(lines[3:]),
+            fontsize=10,
+            color="#4A4A4A",
+            transform=axis.transAxes,
+        )
+    if previous_total > 0 or total > 0:
+        max_value = max(total, previous_total, 1)
+        axis.barh([0.08], [previous_total], color="#BAB0AC", height=0.08)
+        axis.barh([0.20], [total], color="#4C78A8", height=0.08)
+        axis.text(max_value * 1.01, 0.08, "прошлый", va="center", fontsize=8, color="#666666")
+        axis.text(max_value * 1.01, 0.20, "текущий", va="center", fontsize=8, color="#333333")
+        axis.set_xlim(0, max_value * 1.35)
+        axis.set_ylim(0, 0.42)
 
 
 def _pie_slices(groups: List[Dict[str, Any]], total: float, limit: int = 8) -> tuple[List[str], List[float]]:
@@ -118,3 +175,8 @@ def _format_axis_money(value: float, _position: float) -> str:
     if value >= 1_000:
         return f"{value / 1_000:.0f}k"
     return f"{value:.0f}"
+
+
+def _format_money_text(value: float) -> str:
+    formatted = f"{value:,.0f}".replace(",", " ")
+    return f"{formatted} ₽"

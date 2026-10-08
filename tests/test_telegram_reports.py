@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from datetime import date
-from pathlib import Path
 
-from budget_bot.telegram_charts import render_expense_chart
+from budget_bot.telegram_reports import expense_report_lines
 
 
-def test_render_expense_chart_writes_png(tmp_path: Path) -> None:
+def test_expense_report_lines_include_dynamic_analysis() -> None:
     summary = {
         "start_date": date(2026, 8, 1),
         "end_date": date(2026, 8, 3),
@@ -27,11 +26,11 @@ def test_render_expense_chart_writes_png(tmp_path: Path) -> None:
         ],
         "subcategories": [],
     }
-    daily_rows = [
-        {"operation_date": date(2026, 8, 1), "total": 500.0},
-        {"operation_date": date(2026, 8, 3), "total": 1000.0},
-    ]
-    output_path = tmp_path / "chart.png"
-    render_expense_chart(summary, daily_rows, output_path)
-    assert output_path.exists()
-    assert output_path.stat().st_size > 0
+
+    lines = expense_report_lines(summary)
+
+    assert "Среднее в день: 500 ₽" in lines
+    assert "Средний чек: 500 ₽" in lines
+    assert "Дней с расходами: 2 из 3" in lines
+    assert "К прошлому периоду: на 500 ₽ больше (50%)" in lines
+    assert "Лидер: Еда - 67%" in lines

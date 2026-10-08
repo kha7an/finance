@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
@@ -640,11 +640,33 @@ class Storage(DbConnection):
         with self._connect() as connection:
             total_row = connection.execute(
                 f"""
-                SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+                SELECT
+                    COALESCE(SUM(amount), 0) AS total,
+                    COUNT(*) AS count,
+                    COUNT(DISTINCT operation_date) AS active_days
                 FROM budget_entries
                 WHERE {where}
                 """,
                 params,
+            ).fetchone()
+            period_days = (end_date - start_date).days + 1
+            previous_end_date = start_date - timedelta(days=1)
+            previous_start_date = previous_end_date - timedelta(days=period_days - 1)
+            previous_params: List[Any] = [
+                self.owner_id,
+                OperationType.EXPENSE.value,
+                previous_start_date,
+                previous_end_date,
+            ]
+            if category:
+                previous_params.append(category)
+            previous_total_row = connection.execute(
+                f"""
+                SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
+                FROM budget_entries
+                WHERE {where}
+                """,
+                previous_params,
             ).fetchone()
             categories = connection.execute(
                 f"""
@@ -668,12 +690,26 @@ class Storage(DbConnection):
                 """,
                 params,
             ).fetchall()
+        total = float_value(total_row["total"])
+        previous_total = float_value(previous_total_row["total"])
+        previous_delta = total - previous_total
+        previous_delta_percent = None
+        if previous_total > 0:
+            previous_delta_percent = previous_delta / previous_total * 100
         return {
             "start_date": start_date,
             "end_date": end_date,
             "category": category,
-            "total": float_value(total_row["total"]),
+            "total": total,
             "count": int(total_row["count"] or 0),
+            "period_days": period_days,
+            "active_days": int(total_row["active_days"] or 0),
+            "previous_start_date": previous_start_date,
+            "previous_end_date": previous_end_date,
+            "previous_total": previous_total,
+            "previous_count": int(previous_total_row["count"] or 0),
+            "previous_delta": previous_delta,
+            "previous_delta_percent": previous_delta_percent,
             "categories": [money_row(row) for row in categories],
             "subcategories": [money_row(row) for row in subcategories],
         }

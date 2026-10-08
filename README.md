@@ -84,6 +84,32 @@ PYTHONPATH=src python -m budget_bot.cli openai-check
 USE_ENV_PROXY=false
 ```
 
+Для VLESS + Reality можно включить отдельный сервис Xray. В `.env` добавь:
+
+```dotenv
+COMPOSE_FILE=docker-compose.yml:docker-compose.vless.yml
+XRAY_CONFIG_JSON='{"log":{"loglevel":"warning"},"inbounds":[{"listen":"0.0.0.0","port":8080,"protocol":"http","settings":{}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"YOUR_SERVER","port":443,"users":[{"id":"YOUR_UUID","encryption":"none","flow":"xtls-rprx-vision"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"YOUR_SNI","fingerprint":"firefox","publicKey":"YOUR_PUBLIC_KEY","shortId":"YOUR_SHORT_ID"}}}]}'
+```
+
+Значения берутся из VLESS-ссылки: сервер и порт после `@`, UUID перед `@`,
+`sni` → `serverName`, `fp` → `fingerprint`, `pbk` → `publicKey`,
+`sid` → `shortId`. Пример рассчитан на TCP + Reality + Vision.
+JSON должен оставаться одной строкой в одинарных кавычках; реальные данные
+подключения храни только в `.env`.
+
+Запуск остаётся прежним: `docker compose up --build bot`. Compose поднимет
+Xray и задаст контейнерам приложения `TELEGRAM_PROXY_URL=http://xray:8080`.
+HTTP-прокси доступен только внутри Docker, порт на компьютере не публикуется.
+Если `OPENAI_PROXY_URL` пуст, OpenAI тоже использует этот туннель по существующему
+правилу. Отдельно заданный `OPENAI_PROXY_URL` сохраняет приоритет.
+Для запуска Python на компьютере нужен другой доступный ему адрес прокси:
+имя `xray` разрешается только внутри Docker.
+
+Чтобы отключить туннель, убери `COMPOSE_FILE` из `.env` и пересоздай бот:
+`docker compose up -d --force-recreate bot`. Он снова возьмёт прокси из `.env`.
+Уже запущенный Xray можно остановить до удаления `COMPOSE_FILE` командой
+`docker compose stop xray`.
+
 Для локального или проксированного Telegram Bot API можно переопределить:
 
 ```bash

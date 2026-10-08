@@ -36,7 +36,37 @@ def expense_report_lines(summary: Dict[str, Any]) -> List[str]:
         f"Всего: {format_money(summary['total'])}",
         f"Операций: {summary['count']}",
     ]
+    total = float(summary["total"])
+    count = int(summary["count"] or 0)
+    period_days = int(summary.get("period_days") or (end_date - start_date).days + 1)
+    active_days = int(summary.get("active_days") or 0)
+    if period_days > 1:
+        lines.append(f"Среднее в день: {format_money(total / period_days)}")
+    if count > 0:
+        lines.append(f"Средний чек: {format_money(total / count)}")
+    if active_days > 0 and active_days != period_days:
+        lines.append(f"Дней с расходами: {active_days} из {period_days}")
+    previous_total = float(summary.get("previous_total") or 0)
+    previous_delta = float(summary.get("previous_delta") or (total - previous_total))
+    previous_delta_percent = summary.get("previous_delta_percent")
+    if previous_total > 0:
+        direction = "больше" if previous_delta > 0 else "меньше"
+        if abs(previous_delta) < 0.01:
+            lines.append("К прошлому периоду: без изменений")
+        elif previous_delta_percent is None:
+            lines.append(f"К прошлому периоду: на {format_money(abs(previous_delta))} {direction}")
+        else:
+            lines.append(
+                f"К прошлому периоду: на {format_money(abs(previous_delta))} {direction} ({abs(float(previous_delta_percent)):.0f}%)"
+            )
+    elif total > 0 and summary.get("previous_start_date"):
+        lines.append("К прошлому периоду: раньше расходов не было")
     groups = summary["subcategories"] if category else summary["categories"]
+    if groups and total > 0:
+        leader = groups[0]
+        name = leader.get("subcategory") if category else leader.get("category")
+        leader_total = float(leader["total"])
+        lines.append(f"Лидер: {name or 'Без категории'} - {leader_total / total:.0%}")
     if groups:
         lines.append("Топ:")
         for row in groups[:5]:
