@@ -3,6 +3,7 @@ from __future__ import annotations
 import mimetypes
 import threading
 import time
+from calendar import monthrange
 from collections import defaultdict
 from datetime import date, datetime, time as local_time, timedelta
 from pathlib import Path
@@ -48,6 +49,20 @@ logger = get_logger(__name__)
 
 MEDIA_GROUP_SETTLE_SECONDS = 2.0
 REMINDER_CHECK_SECONDS = 60.0 * 60
+
+
+def _parse_stats_month_payload(payload: str) -> Optional[date]:
+    try:
+        year_text, month_text = payload.split("-", 1)
+        return date(int(year_text), int(month_text), 1)
+    except ValueError:
+        return None
+
+
+def _month_report_end(month_start: date, today: date) -> date:
+    if month_start.year == today.year and month_start.month == today.month:
+        return today
+    return date(month_start.year, month_start.month, monthrange(month_start.year, month_start.month)[1])
 
 
 class TelegramBot:
@@ -275,7 +290,7 @@ class TelegramBot:
         if action in ENTRY_ACTIONS:
             self._entry_editor().handle_callback(callback, chat_id, action, payload)
             return
-        if action in {"menu", "stats", "statscat", "statsdate", "statsrange", "sync", "analytics", "chart"}:
+        if action in {"menu", "stats", "statsmonth", "statscat", "statsdate", "statsrange", "sync", "analytics", "chart"}:
             self._handle_stats_callback(callback, chat_id, action, payload)
             return
         if action in MANUAL_ACTIONS:
@@ -870,6 +885,14 @@ class TelegramBot:
                 self._send_stats_period_picker(chat_id)
                 return
             self._send_expense_report(chat_id, today.replace(day=1), today)
+            return
+        if action == "statsmonth":
+            month_start = _parse_stats_month_payload(payload)
+            if month_start is None:
+                self._send_message(chat_id, "Месяц устарел. Открой аналитику заново.", reply_markup=self._main_reply_keyboard())
+                return
+            month_end = _month_report_end(month_start, today)
+            self._send_expense_report(chat_id, month_start, month_end)
             return
         if action == "statsdate":
             self._handle_stats_date_callback(chat_id, payload, today)

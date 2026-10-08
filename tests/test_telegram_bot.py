@@ -44,6 +44,8 @@ def _stats_bot(storage: FakeStatsStorage) -> TelegramBot:
         bot.sent_messages.append((chat_id, text, reply_markup))
 
     bot._send_message = send_message
+    bot._answer_callback = lambda _callback_id, _text: None
+    bot._delete_callback_message = lambda _callback: None
     return bot
 
 
@@ -118,6 +120,29 @@ def test_stats_range_picker_sends_sorted_period_report() -> None:
 
     assert storage.report_periods == [(date(2026, 8, 1), date(2026, 8, 24), None)]
     assert "Расходы 01.08 - 24.08" in bot.sent_messages[0][1]
+
+
+def test_month_report_has_month_navigation() -> None:
+    bot = _stats_bot(FakeStatsStorage())
+
+    bot._send_expense_report(123, date(2026, 8, 1), date(2026, 8, 31))
+
+    _chat_id, _text, reply_markup = bot.sent_messages[0]
+    assert reply_markup["inline_keyboard"][0] == [
+        {"text": "<", "callback_data": "statsmonth:2026-07"},
+        {"text": "08.2026", "callback_data": "stats:month"},
+        {"text": ">", "callback_data": "statsmonth:2026-09"},
+    ]
+
+
+def test_stats_month_callback_sends_selected_month_report() -> None:
+    storage = FakeStatsStorage()
+    bot = _stats_bot(storage)
+
+    bot._handle_stats_callback({"id": "callback-id"}, 123, "statsmonth", "2025-02")
+
+    assert storage.report_periods == [(date(2025, 2, 1), date(2025, 2, 28), None)]
+    assert "Расходы 01.02 - 28.02" in bot.sent_messages[0][1]
 
 
 def test_processing_result_has_edit_entries_button_for_written_period() -> None:

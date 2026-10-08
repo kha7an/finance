@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from calendar import monthrange
 from datetime import date, timedelta
 from typing import Any, Dict, Optional
 
@@ -416,13 +417,36 @@ def is_entry_search_pending(pending: Dict[str, Any]) -> bool:
 
 def expense_report_keyboard(start_date: date, end_date: date, category: Optional[str] = None) -> Dict[str, Any]:
     payload = chart_period_payload(start_date, end_date, category)
-    return {
-        "inline_keyboard": [
+    rows = []
+    if category is None and _is_month_report(start_date, end_date):
+        previous_month = _shift_month(start_date, -1)
+        next_month = _shift_month(start_date, 1)
+        rows.append(
+            [
+                {"text": "<", "callback_data": f"statsmonth:{previous_month.strftime('%Y-%m')}"},
+                {"text": start_date.strftime("%m.%Y"), "callback_data": "stats:month"},
+                {"text": ">", "callback_data": f"statsmonth:{next_month.strftime('%Y-%m')}"},
+            ]
+        )
+    rows.extend(
+        [
             [{"text": "Записи", "callback_data": f"entrylist:{payload}"}],
             [{"text": "Диаграмма", "callback_data": f"chart:{payload}"}],
             [{"text": "Главное меню", "callback_data": "menu:home"}],
         ]
-    }
+    )
+    return {"inline_keyboard": rows}
+
+
+def _is_month_report(start_date: date, end_date: date) -> bool:
+    today = date.today()
+    month_end = date(start_date.year, start_date.month, monthrange(start_date.year, start_date.month)[1])
+    return start_date.day == 1 and end_date in {month_end, today}
+
+
+def _shift_month(current: date, offset: int) -> date:
+    month_index = current.year * 12 + current.month - 1 + offset
+    return date(month_index // 12, month_index % 12 + 1, 1)
 
 
 def _entrylist_payload(start_date: date, end_date: date, category: Optional[str] = None) -> str:
