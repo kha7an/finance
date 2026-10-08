@@ -43,6 +43,7 @@ from .telegram_reports import parse_stats_period as _parse_stats_period
 from .telegram_reports import chart_period_payload as _chart_period_payload
 from .telegram_reports import parse_chart_period_payload as _parse_chart_period_payload
 from .telegram_charts import render_expense_chart
+from .telegram_analytics import TelegramAnalytics
 
 
 logger = get_logger(__name__)
@@ -114,6 +115,7 @@ class TelegramBot:
                     self.handle_update(update)
                 self._flush_ready_media_groups()
                 self._send_due_reminders()
+                self._analytics().send_due_notifications()
                 time.sleep(0.5)
             except Exception as exc:
                 if self.api_client.is_getupdates_timeout(exc):
@@ -176,10 +178,29 @@ class TelegramBot:
         if "photo" in message:
             self._handle_photo(message)
             return
+        if "document" in message:
+            self._handle_document(message)
+            return
         if "text" in message:
             self._handle_text(message)
             return
-        self._send_message(chat_id, "Пришли скриншот истории операций.", reply_markup=self._main_reply_keyboard())
+        self._send_message(chat_id, "Пришли скриншот или PDF-выписку Т-Банка.", reply_markup=self._main_reply_keyboard())
+
+    def _handle_document(self, message: Dict[str, Any]) -> None:
+        chat_id = message["chat"]["id"]
+        document = message["document"]
+        if document.get("mime_type") != "application/pdf" and not str(document.get("file_name", "")).lower().endswith(".pdf"):
+            self._send_message(chat_id, "Пришли справку о движении средств Т-Банка в формате PDF.")
+            return
+        if int(document.get("file_size") or 0) > self.context.settings.max_upload_bytes:
+            self._send_message(chat_id, "PDF превышает допустимый размер загрузки.")
+            return
+        try:
+            self.parse_jobs.enqueue_document(chat_id, document["file_id"])
+            self._send_message(chat_id, "Обрабатываю PDF-выписку...")
+        except Exception as exc:
+            logger.exception("telegram document enqueue error", extra=log_extra(chat_id=chat_id))
+            self._send_message(chat_id, f"Не смог поставить PDF в очередь: {exc}")
 
     def _handle_photo(self, message: Dict[str, Any]) -> None:
         if message.get("media_group_id"):
@@ -286,6 +307,10 @@ class TelegramBot:
 
         if action in {"reset", "reset_confirm", "reset_cancel"}:
             self._handle_reset_callback(callback, chat_id, action)
+            return
+        if action in {"analysis", "af", "ac", "cf"}:
+            prefix = {"af": "filter:", "ac": "compare:", "cf": "comparefilter:"}.get(action, "")
+            self._analytics().handle_callback(callback, chat_id, prefix + payload)
             return
         if action in ENTRY_ACTIONS:
             self._entry_editor().handle_callback(callback, chat_id, action, payload)
@@ -440,7 +465,7 @@ class TelegramBot:
         if text.startswith("/start") or text.startswith("/help"):
             self._send_message(
                 chat_id,
-                "Готов. Пришли скриншот истории операций, я распознаю его и запишу в бюджет.",
+                "Готов. Пришли скриншот истории операций или PDF-выписку Т-Банка, я обработаю её и запишу в бюджет.",
                 reply_markup=self._main_reply_keyboard(),
             )
             return
@@ -464,6 +489,9 @@ class TelegramBot:
             return
         if text.startswith("/reminders"):
             self._send_reminder_settings(chat_id)
+            return
+        if text and text.split(maxsplit=1)[0].split("@")[0] == "/limit":
+            self._analytics().handle_limit_text(chat_id, text, message.get("from", {}).get("id"))
             return
         if text.startswith("/stats"):
             self._handle_stats_text(chat_id, text)
@@ -1022,8 +1050,17 @@ class TelegramBot:
         caption = f"Расходы {start_date.strftime('%d.%m')} – {end_date.strftime('%d.%m')}"
         if category:
             caption = f"{caption}: {category}"
+        if summary.get("exclude_mandatory"):
+            caption += f" · без обязательных (исключено {_format_money(summary['excluded_total'])})"
         if not self._send_photo(chat_id, chart_path, caption=caption):
             self._send_message(chat_id, "Не смог отправить диаграмму.", reply_markup=self._main_reply_keyboard())
+
+    def _analytics(self) -> TelegramAnalytics:
+        analytics = getattr(self, "_telegram_analytics", None)
+        if analytics is None:
+            analytics = TelegramAnalytics(self)
+            self._telegram_analytics = analytics
+        return analytics
 
     def _entry_editor(self) -> TelegramEntryEditor:
         editor = getattr(self, "_telegram_entry_editor", None)
@@ -1170,7 +1207,7 @@ class TelegramBot:
     def _send_analytics_menu(self, chat_id: int) -> None:
         self._send_message(
             chat_id,
-            "Аналитика:",
+            "Аналитика · текстовые отчёты, диаграмма по кнопке:",
             reply_markup={
                 "inline_keyboard": [
                     [
@@ -1183,6 +1220,19 @@ class TelegramBot:
                         {"text": "Даты", "callback_data": "stats:period"},
                     ],
                     [
+                        {"text": "Сравнение", "callback_data": "analysis:compare"},
+                        {"text": "Доходы и остаток", "callback_data": "analysis:balance"},
+                    ],
+                    [
+                        {"text": "Динамика", "callback_data": "analysis:trends"},
+                        {"text": "Прогноз", "callback_data": "analysis:forecast"},
+                    ],
+                    [
+                        {"text": "Лимиты", "callback_data": "analysis:limits"},
+                        {"text": "Настройки", "callback_data": "analysis:settings"},
+                    ],
+                    [
+                        {"text": "Все / без обязательных", "callback_data": "analysis:filter"},
                         {"text": "Диаграмма", "callback_data": "chart:month"},
                     ],
                 ]
@@ -1447,7 +1497,7 @@ class TelegramBot:
 
     def _send_processing_result(self, chat_id: int, result) -> None:
         if not result.decisions:
-            self._send_message(chat_id, "Этот скрин уже обработан, дубли не добавляю.")
+            self._send_message(chat_id, "Этот файл уже обработан, дубли не добавляю.")
             return
 
         written = [item for item in result.decisions if item.status == OperationStatus.AUTO_WRITTEN]

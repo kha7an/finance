@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from budget_bot.models import OperationStatus, OperationType, ParsedOperation
@@ -82,6 +83,25 @@ def test_written_summary_preserves_screenshot_order() -> None:
     assert lines[2].startswith("- Yandex Fasten:")
     assert lines[3].startswith("- Waypma 24:")
     assert lines[4].startswith("- Fix Price:")
+
+
+def test_document_handler_enqueues_pdf_and_rejects_large_or_other_files() -> None:
+    bot = _stats_bot(FakeStatsStorage())
+    bot.context.settings = SimpleNamespace(max_upload_bytes=1000)
+    queued = []
+    bot.parse_jobs = SimpleNamespace(enqueue_document=lambda *args: queued.append(args))
+
+    for document in [
+        {"file_id": "pdf", "file_name": "statement.PDF", "file_size": 500},
+        {"file_id": "large", "mime_type": "application/pdf", "file_size": 1001},
+        {"file_id": "other", "file_name": "statement.xlsx"},
+    ]:
+        bot._handle_document({"chat": {"id": 123}, "document": document})
+
+    assert queued == [(123, "pdf")]
+    assert "Обрабатываю PDF" in bot.sent_messages[0][1]
+    assert "размер" in bot.sent_messages[1][1]
+    assert "формате PDF" in bot.sent_messages[2][1]
 
 
 def test_stats_period_picker_offers_date_and_range_buttons() -> None:

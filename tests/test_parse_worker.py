@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from budget_bot.parse_worker import ParseJobWorker
@@ -91,3 +92,18 @@ def test_parse_worker_does_not_requeue_done_job_when_response_send_fails() -> No
 
     assert bot.storage.finished == [7]
     assert bot.storage.requeued == []
+
+
+def test_parse_worker_processes_pdf_inside_owner_scope() -> None:
+    bot = FakeBot()
+    bot.context.settings = SimpleNamespace(max_upload_bytes=1000)
+    bot.storage.job["payload"]["document"] = True
+    calls = []
+    bot.context.parse_and_process = lambda **kwargs: calls.append((bot.context.owner_id, kwargs)) or FakeResult()
+
+    assert ParseJobWorker(bot).process_next_job() is True
+
+    assert calls[0][0] == "telegram:42"
+    assert calls[0][1]["mime_type"] == "application/pdf"
+    assert calls[0][1]["telegram_file_id"] == "file-1"
+    assert bot.storage.finished == [7]

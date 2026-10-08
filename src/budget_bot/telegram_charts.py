@@ -23,6 +23,8 @@ def render_expense_chart(
     title = f"Расходы {start_date.strftime('%d.%m')} – {end_date.strftime('%d.%m')}"
     if category:
         title = f"{title}: {category}"
+    if summary.get("exclude_mandatory"):
+        title += f"\nБез обязательных · исключено: {_format_money_text(summary['excluded_total'])}"
 
     pie_labels, pie_values = _pie_slices(groups, float(summary["total"]))
     daily_dates, daily_values = _daily_series(start_date, end_date, daily_rows)
@@ -63,6 +65,7 @@ def render_expense_chart(
         bar_axis.set_title("По дням", fontsize=11)
         bar_axis.set_ylabel("₽")
         bar_axis.yaxis.set_major_formatter(plt.FuncFormatter(_format_axis_money))
+        bar_axis.xaxis.set_major_locator(mdates.DayLocator(interval=max(1, len(daily_dates) // 10)))
         bar_axis.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
         figure.autofmt_xdate(rotation=45, ha="right")
 
@@ -114,12 +117,12 @@ def _render_metrics(axis, summary: Dict[str, Any]) -> None:
         )
     if previous_total > 0 or total > 0:
         max_value = max(total, previous_total, 1)
-        axis.barh([0.08], [previous_total], color="#BAB0AC", height=0.08)
-        axis.barh([0.20], [total], color="#4C78A8", height=0.08)
-        axis.text(max_value * 1.01, 0.08, "прошлый", va="center", fontsize=8, color="#666666")
-        axis.text(max_value * 1.01, 0.20, "текущий", va="center", fontsize=8, color="#333333")
+        axis.barh([0.05], [previous_total], color="#BAB0AC", height=0.06)
+        axis.barh([0.16], [total], color="#4C78A8", height=0.06)
+        axis.text(max_value * 1.01, 0.05, "прошлый", va="center", fontsize=8, color="#666666")
+        axis.text(max_value * 1.01, 0.16, "текущий", va="center", fontsize=8, color="#333333")
         axis.set_xlim(0, max_value * 1.35)
-        axis.set_ylim(0, 0.42)
+        axis.set_ylim(0, 0.65)
 
 
 def _pie_slices(groups: List[Dict[str, Any]], total: float, limit: int = 8) -> tuple[List[str], List[float]]:

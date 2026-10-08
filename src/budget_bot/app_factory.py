@@ -7,6 +7,7 @@ from datetime import date
 from typing import Dict, Iterator
 
 from .config import Settings, validate_llm_settings
+from .bank_statement import parse_bank_statement
 from .llm import VisionClient, build_vision_client
 from .log_config import get_logger, log_extra
 from .processor import ScreenshotProcessor
@@ -77,6 +78,11 @@ class AppContext:
         screenshot_date: date,
         telegram_file_id: str | None = None,
     ):
+        if mime_type == "application/pdf":
+            if len(image_content) > self.settings.max_upload_bytes:
+                raise ValueError("PDF превышает допустимый размер загрузки.")
+            parsed = parse_bank_statement(image_content)
+            return self.processor.process(image_content, parsed, telegram_file_id)
         started_at = time.monotonic()
         logger.info(
             "parse pipeline llm start",

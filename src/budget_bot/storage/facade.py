@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 from psycopg.types.json import Jsonb
 
 from ..categories import CategoryBook
+from ..analytics import previous_period
 from ..default_categories import DEFAULT_EXPENSE_CATEGORIES, DEFAULT_INCOME_CATEGORIES
 from ..migrations.runner import upgrade_head
 from ..models import OperationStatus, OperationType, ParsedOperation
@@ -435,6 +436,7 @@ class Storage(DbConnection):
                 "source_images",
                 "learned_expense_categories",
                 "budget_entries",
+                "analytics_deliveries",
             ]:
                 connection.execute(f"DELETE FROM {table} WHERE owner_id = %s", (self.owner_id,))
             connection.execute(
@@ -620,6 +622,164 @@ class Storage(DbConnection):
                 )
         return len(rows)
 
+    def analytics_settings(self) -> Dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM analytics_settings WHERE owner_id = %s", (self.owner_id,),
+            ).fetchone()
+        return dict(row) if row else {
+            "exclude_mandatory": False, "mandatory_rules": [], "limits": {},
+            "weekly_enabled": False, "weekly_chat_id": None,
+        }
+
+    def update_analytics_settings(self, **changes: Any) -> None:
+        allowed = {"exclude_mandatory", "weekly_enabled", "weekly_chat_id"}
+        if not changes or not set(changes) <= allowed:
+            raise ValueError("Invalid analytics settings")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO analytics_settings (owner_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (self.owner_id,),
+            )
+            values = list(changes.values())
+            assignments = ", ".join(f"{key} = %s" for key in changes)
+            connection.execute(
+                f"UPDATE analytics_settings SET {assignments} WHERE owner_id = %s",
+                [*values, self.owner_id],
+            )
+
+    def toggle_mandatory_rule(self, category: str, subcategory: str = "") -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO analytics_settings (owner_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (self.owner_id,),
+            )
+            row = connection.execute(
+                "SELECT mandatory_rules FROM analytics_settings WHERE owner_id = %s FOR UPDATE",
+                (self.owner_id,),
+            ).fetchone()
+            rules = row["mandatory_rules"]
+            rule = [category, subcategory]
+            if rule in rules:
+                rules.remove(rule)
+            else:
+                rules.append(rule)
+            connection.execute(
+                "UPDATE analytics_settings SET mandatory_rules = %s WHERE owner_id = %s",
+                (Jsonb(rules), self.owner_id),
+            )
+
+    def set_analytics_limit(self, category: str, amount: Decimal) -> None:
+        if not amount.is_finite() or amount < 0 or amount > Decimal("999999999999.99"):
+            raise ValueError("Limit must be finite, non-negative and within range")
+        rounded = amount.quantize(Decimal("0.01"))
+        if amount > 0 and rounded == 0:
+            raise ValueError("Limit must be at least one kopek")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO analytics_settings (owner_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (self.owner_id,),
+            )
+            if amount == 0:
+                connection.execute(
+                    "UPDATE analytics_settings SET limits = limits - %s WHERE owner_id = %s",
+                    (category, self.owner_id),
+                )
+            else:
+                connection.execute(
+                    """UPDATE analytics_settings
+                       SET limits = jsonb_set(limits, %s, %s) WHERE owner_id = %s""",
+                    ([category], Jsonb(str(rounded)), self.owner_id),
+                )
+
+    def toggle_mandatory_entry(self, entry_id: int) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """UPDATE budget_entries SET is_mandatory = NOT is_mandatory
+                   WHERE owner_id = %s AND id = %s AND operation_type = 'expense'
+                   RETURNING id""", (self.owner_id, entry_id),
+            ).fetchone()
+        return row is not None
+
+    def analytics_rows(self, start_date: date, end_date: date) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT operation_date, operation_type, category, subcategory, is_mandatory,
+                          SUM(amount) AS total, COUNT(*) AS count
+                   FROM budget_entries
+                   WHERE owner_id = %s AND operation_date BETWEEN %s AND %s
+                   GROUP BY operation_date, operation_type, category, subcategory, is_mandatory
+                   ORDER BY operation_date""", (self.owner_id, start_date, end_date),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _analytics_expense_filter(self) -> tuple[str, List[Any]]:
+        settings = self.analytics_settings()
+        if not settings["exclude_mandatory"]:
+            return "", []
+        clauses = ["is_mandatory = FALSE"]
+        params: List[Any] = []
+        for category, subcategory in settings["mandatory_rules"]:
+            if subcategory:
+                clauses.append("NOT (COALESCE(category, '') = %s AND COALESCE(subcategory, '') = %s)")
+                params.extend([category, subcategory])
+            else:
+                clauses.append("COALESCE(category, '') <> %s")
+                params.append(category)
+        return " AND " + " AND ".join(clauses), params
+
+    def analytics_subscribers(self) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT s.*, tc.user_id, rs.timezone FROM analytics_settings s
+                   JOIN telegram_chats tc ON tc.chat_id = s.weekly_chat_id AND tc.owner_id = s.owner_id
+                   LEFT JOIN reminder_settings rs ON rs.chat_id = tc.chat_id
+                   WHERE s.weekly_enabled OR s.limits <> '{}'::jsonb""",
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_analytics_notification(self, kind: str, period_start: date, key: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """INSERT INTO analytics_deliveries
+                       (owner_id, kind, period_start, delivery_key, sent_at, status)
+                   VALUES (%s, %s, %s, %s, %s, 'sending')
+                   ON CONFLICT (owner_id, kind, period_start, delivery_key) DO UPDATE
+                       SET sent_at = excluded.sent_at
+                   WHERE analytics_deliveries.status = 'sending'
+                       AND analytics_deliveries.sent_at < CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                   RETURNING owner_id""",
+                (self.owner_id, kind, period_start, key, now_iso()),
+            ).fetchone()
+        return row is not None
+
+    def release_analytics_notification(self, kind: str, period_start: date, key: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """DELETE FROM analytics_deliveries WHERE owner_id = %s AND kind = %s
+                   AND period_start = %s AND delivery_key = %s AND status = 'sending'""",
+                (self.owner_id, kind, period_start, key),
+            )
+
+    def analytics_notification_sent(self, kind: str, period_start: date, key: str) -> bool:
+        with self._connect() as connection:
+            return connection.execute(
+                """SELECT 1 FROM analytics_deliveries
+                   WHERE owner_id = %s AND kind = %s AND period_start = %s AND delivery_key = %s
+                       AND status = 'sent'""",
+                (self.owner_id, kind, period_start, key),
+            ).fetchone() is not None
+
+    def mark_analytics_notification(self, kind: str, period_start: date, key: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO analytics_deliveries (owner_id, kind, period_start, delivery_key, sent_at)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (owner_id, kind, period_start, delivery_key)
+                   DO UPDATE SET status = 'sent', sent_at = excluded.sent_at""",
+                (self.owner_id, kind, period_start, key, now_iso()),
+            )
+
     def expense_summary(
         self,
         start_date: date,
@@ -636,7 +796,9 @@ class Storage(DbConnection):
         if category:
             clauses.append("category = %s")
             params.append(category)
-        where = " AND ".join(clauses)
+        filter_sql, filter_params = self._analytics_expense_filter()
+        params.extend(filter_params)
+        where = " AND ".join(clauses) + filter_sql
         with self._connect() as connection:
             total_row = connection.execute(
                 f"""
@@ -649,9 +811,15 @@ class Storage(DbConnection):
                 """,
                 params,
             ).fetchone()
+            excluded_total = 0.0
+            if filter_sql:
+                all_total = connection.execute(
+                    f"SELECT COALESCE(SUM(amount), 0) AS total FROM budget_entries WHERE {' AND '.join(clauses)}",
+                    params[:-len(filter_params)] if filter_params else params,
+                ).fetchone()
+                excluded_total = float_value(all_total["total"]) - float_value(total_row["total"])
             period_days = (end_date - start_date).days + 1
-            previous_end_date = start_date - timedelta(days=1)
-            previous_start_date = previous_end_date - timedelta(days=period_days - 1)
+            previous_start_date, previous_end_date = previous_period(start_date, end_date)
             previous_params: List[Any] = [
                 self.owner_id,
                 OperationType.EXPENSE.value,
@@ -660,6 +828,7 @@ class Storage(DbConnection):
             ]
             if category:
                 previous_params.append(category)
+            previous_params.extend(filter_params)
             previous_total_row = connection.execute(
                 f"""
                 SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
@@ -704,6 +873,8 @@ class Storage(DbConnection):
             "count": int(total_row["count"] or 0),
             "period_days": period_days,
             "active_days": int(total_row["active_days"] or 0),
+            "exclude_mandatory": bool(filter_sql),
+            "excluded_total": excluded_total,
             "previous_start_date": previous_start_date,
             "previous_end_date": previous_end_date,
             "previous_total": previous_total,
@@ -730,7 +901,9 @@ class Storage(DbConnection):
         if category:
             clauses.append("category = %s")
             params.append(category)
-        where = " AND ".join(clauses)
+        filter_sql, filter_params = self._analytics_expense_filter()
+        params.extend(filter_params)
+        where = " AND ".join(clauses) + filter_sql
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
@@ -880,7 +1053,7 @@ class Storage(DbConnection):
                 SELECT id, owner_id, source, operation_hash,
                        export_sheet AS workbook_sheet, export_row AS workbook_row,
                        operation_date, operation_type, amount, category, subcategory,
-                       name, note, bank, created_at, updated_at
+                       name, note, bank, is_mandatory, created_at, updated_at
                 FROM budget_entries
                 WHERE owner_id = %s AND id = %s
                 """,

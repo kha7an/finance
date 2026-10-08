@@ -3,14 +3,19 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from budget_bot.telegram_charts import render_expense_chart
 
 
-def test_render_expense_chart_writes_png(tmp_path: Path) -> None:
+@pytest.mark.parametrize("filtered", [False, True])
+def test_render_expense_chart_writes_png(tmp_path: Path, filtered: bool) -> None:
     summary = {
         "start_date": date(2026, 8, 1),
         "end_date": date(2026, 8, 3),
         "category": None,
+        "exclude_mandatory": filtered,
+        "excluded_total": 37000,
         "total": 1500.0,
         "count": 3,
         "period_days": 3,

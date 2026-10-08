@@ -10,7 +10,7 @@ from .telegram_common import button_rows, format_money, operation_summary_text, 
 from .telegram_reports import chart_period_payload
 
 
-ENTRY_ACTIONS = {"entrylist", "entryfind", "entry", "edel", "edelok", "eamt", "edate", "ename", "ecat", "esub", "eback"}
+ENTRY_ACTIONS = {"entrylist", "entryfind", "entry", "edel", "edelok", "eamt", "edate", "ename", "ecat", "esub", "eback", "emandatory"}
 ENTRY_LIST_PAGE_SIZE = 15
 ENTRY_SEARCH_RESULT_LIMIT = 10
 
@@ -101,6 +101,12 @@ class TelegramEntryEditor:
             self.bot._answer_callback(callback["id"], "Жду текст")
             self.bot._delete_callback_message(callback)
             self.bot._send_message(chat_id, prompt)
+            return
+        if action == "emandatory":
+            changed = self.bot.context.storage.toggle_mandatory_entry(entry_id)
+            self.bot._answer_callback(callback["id"], "Обновлено" if changed else "Только для расходов")
+            self.bot._delete_callback_message(callback)
+            self.send_entry_actions(chat_id, self.bot.context.storage.get_budget_entry(entry_id))
             return
         if action == "ecat":
             category_index = parse_index(payload, 1)
@@ -318,6 +324,8 @@ class TelegramEntryEditor:
                         {"text": "Описание", "callback_data": f"ename:{entry_id}"},
                         {"text": "Категория", "callback_data": f"ecat:{entry_id}"},
                     ],
+                    *([[{"text": "Обязательная ✓" if entry.get("is_mandatory") else "Отметить обязательной",
+                          "callback_data": f"emandatory:{entry_id}"}]] if entry["operation_type"] == "expense" else []),
                     [{"text": "Удалить", "callback_data": f"edel:{entry_id}"}],
                 ]
             },
@@ -432,6 +440,9 @@ def expense_report_keyboard(start_date: date, end_date: date, category: Optional
         [
             [{"text": "Записи", "callback_data": f"entrylist:{payload}"}],
             [{"text": "Диаграмма", "callback_data": f"chart:{payload}"}],
+            [{"text": "Сравнить", "callback_data": f"ac:{payload}"}],
+            [{"text": "Все / без обязательных", "callback_data": f"af:{payload}"}],
+            [{"text": "Аналитика", "callback_data": "analytics:menu"}],
             [{"text": "Главное меню", "callback_data": "menu:home"}],
         ]
     )

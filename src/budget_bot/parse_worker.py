@@ -47,7 +47,7 @@ class ParseJobWorker:
                 job_row = self.bot.context.storage.get_parse_job(job_id)
             if job_row and job_row.get("status") == "failed":
                 try:
-                    self.bot._send_message(chat_id, f"Не смог обработать скрин: {error_text}")
+                    self.bot._send_message(chat_id, f"Не смог обработать файл: {error_text}")
                 except Exception:
                     logger.exception(
                         "parse job failure notification failed",
@@ -96,6 +96,10 @@ class ParseJobWorker:
         images: List[Tuple[bytes, str]] = []
         for file_id in file_ids:
             content, mime_type = self.bot._download_file(file_id)
+            if payload.get("document"):
+                mime_type = "application/pdf"
+                if len(content) > self.bot.context.settings.max_upload_bytes:
+                    raise ValueError("PDF превышает допустимый размер загрузки.")
             self.bot._save_image_for_replay(content, mime_type)
             images.append((content, mime_type))
 
@@ -136,3 +140,8 @@ class ParseJobWorker:
             "screenshot_date": (screenshot_date or date.today()).isoformat(),
         }
         return self.bot.context.storage.enqueue_parse_job(chat_id, "album", payload)
+
+    def enqueue_document(self, chat_id: int, file_id: str) -> int:
+        return self.bot.context.storage.enqueue_parse_job(
+            chat_id, "single", {"file_ids": [file_id], "document": True},
+        )

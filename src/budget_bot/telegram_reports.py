@@ -36,6 +36,10 @@ def expense_report_lines(summary: Dict[str, Any]) -> List[str]:
         f"Всего: {format_money(summary['total'])}",
         f"Операций: {summary['count']}",
     ]
+    if summary.get("exclude_mandatory"):
+        lines.append(f"Без обязательных · исключено: {format_money(summary['excluded_total'])}")
+    if summary.get("previous_start_date"):
+        lines.append(f"Сравнение с {summary['previous_start_date']:%d.%m.%Y}–{summary['previous_end_date']:%d.%m.%Y}")
     total = float(summary["total"])
     count = int(summary["count"] or 0)
     period_days = int(summary.get("period_days") or (end_date - start_date).days + 1)
