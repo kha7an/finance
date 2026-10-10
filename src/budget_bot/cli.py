@@ -82,7 +82,7 @@ def main() -> None:
                 raise RuntimeError("Use period format like 01.08-24.08")
             start_date, end_date = period
         else:
-            start_date, end_date = today.replace(day=1), today
+            start_date, end_date = date.min, date.max
         path = ExcelExporter(context.storage, context.settings.export_dir).export(args.owner, start_date, end_date)
         print(f"Excel export: {path}")
         return

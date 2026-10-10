@@ -988,7 +988,7 @@ class TelegramBot:
                 return
             start_date, end_date = period
         else:
-            start_date, end_date = today.replace(day=1), today
+            start_date, end_date = date.min, date.max
         path = ExcelExporter(self.context.storage, self.context.settings.export_dir).export(
             owner_id=self.context.owner_id,
             start_date=start_date,
