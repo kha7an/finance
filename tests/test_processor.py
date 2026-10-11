@@ -4,9 +4,121 @@ from datetime import date
 from typing import Dict, Iterable, List, Optional
 
 from budget_bot.default_categories import DEFAULT_EXPENSE_CATEGORIES, DEFAULT_INCOME_CATEGORIES
-from budget_bot.models import OperationStatus, ParsedOperation, ParsedScreenshot
+from budget_bot.models import OperationStatus, OperationType, ParsedOperation, ParsedScreenshot
 from budget_bot.processor import ScreenshotProcessor
 from budget_bot.storage.facade import BudgetEntryInsert, OperationRecord
+import pytest
+
+
+@pytest.mark.parametrize("statement_name, history_name", [
+    ("YANDEX*FASTEN g. Moskva RUS", "Яндекс Фастен"),
+    ("PYATEROCHKA 19880 Arsk RUS", "Пятёрочка"),
+    ("TRANSKART.RU KAZAN RUS", "Транспортная карта"),
+    ("MUP METROELEKTROTRANS Kazan RUS", "Метроэлектротранс"),
+    ("AptekaFarmlend1001 Kazan RUS", "АптекаFarmlend25"),
+    ("KRASNOE&BELOE Kazan RUS", "Красное и белое"),
+    ("WAYPMA 24 Kazan RUS", "Waypma 24"),
+    ("PEREKRESTOK TANDEM Kazan RUS", "Перекрёсток"),
+    ("DOSTAVKA PEREKRESTKA_S MOSCOW RUS", "Перекрёсток доставка"),
+])
+def test_statement_matches_normalized_history(statement_name, history_name):
+    from budget_bot.processor import _statement_name_key
+    assert _statement_name_key(statement_name) == _statement_name_key(history_name)
+
+
+def test_statement_copies_category_from_history():
+    storage = FakeStorage([{
+        "operation_date": "2026-08-01", "operation_type": "expense", "amount": 100,
+        "name": "Яндекс Фастен", "category": "Транспорт", "subcategory": "Такси", "bank": "tbank",
+    }])
+    parsed = ParsedScreenshot("tbank", [ParsedOperation(
+        date=date(2026, 10, 8), name="YANDEX*FASTEN g. Moskva RUS", amount=-172,
+        type=OperationType.EXPENSE,
+    )], {"source": "tbank_pdf"})
+    result = ScreenshotProcessor(storage, storage.category_book()).process(b"statement", parsed)
+    assert result.decisions[0].status == OperationStatus.AUTO_WRITTEN
+    assert storage.budget_entries[0].operation.subcategory == "Такси"
+
+
+def test_statement_conflicting_history_requires_review_even_with_keyword_rule():
+    storage = FakeStorage([{
+        "operation_date": "2026-08-01", "operation_type": "expense", "amount": 100,
+        "name": "Surf Coffee", "category": "Еда", "subcategory": subcategory, "bank": "tbank",
+    } for subcategory in ("Кофейни", "Рестораны")])
+    parsed = ParsedScreenshot("tbank", [ParsedOperation(
+        date=date(2026, 10, 8), name="Surf Coffee x Kremlin Kazan RUS", amount=-172,
+        type=OperationType.EXPENSE,
+    )], {"source": "tbank_pdf"})
+    result = ScreenshotProcessor(storage, storage.category_book()).process(b"statement", parsed)
+    assert result.decisions[0].status == OperationStatus.PENDING
+    assert not storage.budget_entries
+
+
+def test_statement_unknown_merchant_is_not_matched_by_similarity():
+    storage = FakeStorage([{
+        "operation_date": "2026-08-01", "operation_type": "expense", "amount": 100,
+        "name": "IP Kostyuk A. N.", "category": "Еда", "subcategory": "Фастфуд", "bank": "tbank",
+    }])
+    parsed = ParsedScreenshot("tbank", [ParsedOperation(
+        date=date(2026, 10, 8), name="IP KOSTYUK YE. N. KAZAN RUS", amount=-25,
+        type=OperationType.EXPENSE,
+    )], {"source": "tbank_pdf"})
+    result = ScreenshotProcessor(storage, storage.category_book()).process(b"statement", parsed)
+    assert result.decisions[0].status == OperationStatus.PENDING
+    assert not storage.budget_entries
+
+
+@pytest.mark.parametrize("rule_name", ["transkart.ru kazan rus", "транспортная карта"])
+def test_statement_manual_rule_overrides_conflicting_history(rule_name):
+    storage = FakeStorage([{
+        "operation_date": "2026-08-01", "operation_type": "expense", "amount": 46,
+        "name": "Транспортная карта", "category": category, "subcategory": subcategory, "bank": "tbank",
+    } for category, subcategory in (("Транспорт", "Местный транспорт"), ("Авто", "Топливо"))])
+    storage.expense_category_rules = lambda: {rule_name: ("Транспорт", "Местный транспорт")}
+    parsed = ParsedScreenshot("tbank", [ParsedOperation(
+        date=date(2026, 10, 8), name="TRANSKART.RU KAZAN RUS", amount=-46,
+        type=OperationType.EXPENSE,
+    )], {"source": "tbank_pdf"})
+    result = ScreenshotProcessor(storage, storage.category_book()).process(b"statement", parsed)
+    assert result.decisions[0].status == OperationStatus.AUTO_WRITTEN
+    assert storage.budget_entries[0].operation.category == "Транспорт"
+
+
+@pytest.mark.parametrize("existing_count, expected_status, remaining", [
+    (1, OperationStatus.PENDING, 2),
+    (2, OperationStatus.AUTO_WRITTEN, 1),
+    (3, OperationStatus.IGNORED, 3),
+])
+def test_statement_accounts_for_existing_repeated_payments(existing_count, expected_status, remaining):
+    storage = FakeStorage([{
+        "operation_date": "2026-10-08", "operation_type": "expense", "amount": 46,
+        "name": "Транспортная карта", "category": "Транспорт",
+        "subcategory": "Местный транспорт", "bank": "tbank",
+    } for _ in range(existing_count)])
+    parsed = ParsedScreenshot("tbank", [ParsedOperation(
+        date=date(2026, 10, 8), name="TRANSKART.RU KAZAN RUS", amount=-46,
+        type=OperationType.EXPENSE,
+    ) for _ in range(3)], {"source": "tbank_pdf", "warning": "Нет итогов"})
+
+    result = ScreenshotProcessor(storage, storage.category_book()).process(b"repeated-statement", parsed)
+
+    assert result.decisions[0].status == expected_status
+    assert result.decisions[0].operation.occurrence_count == remaining
+    assert result.warning == "Нет итогов"
+    assert len(storage.budget_entries) == (1 if existing_count == 2 else 0)
+
+
+def test_statement_normalized_duplicate_does_not_ignore_different_date_amount_or_type():
+    from budget_bot.processor import _matches_existing_entry
+
+    entry = {
+        "operation_date": "2026-10-08", "operation_type": "expense", "amount": 46,
+        "name": "Транспортная карта", "bank": "tbank",
+    }
+    operation = ParsedOperation(date(2026, 10, 8), "TRANSKART.RU KAZAN RUS", -46, OperationType.EXPENSE)
+    assert _matches_existing_entry("tbank", operation, [entry])
+    for field, value in [("operation_date", "2026-10-07"), ("amount", 47), ("operation_type", "income"), ("bank", "sber")]:
+        assert not _matches_existing_entry("tbank", operation, [{**entry, field: value}])
 
 
 class FakeStorage:

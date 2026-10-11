@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import date
 from difflib import SequenceMatcher
 import re
 from typing import Dict, List, Optional, Tuple
@@ -25,6 +26,7 @@ class ProcessingResult:
     image_hash: str
     bank: str
     decisions: List[OperationDecision]
+    warning: Optional[str] = None
 
 
 class ScreenshotProcessor:
@@ -57,7 +59,23 @@ class ScreenshotProcessor:
         decisions: List[OperationDecision] = []
         try:
             learned_rules = self.storage.expense_category_rules()
-            grouped_operations = self._group_same_operations(parsed.operations, learned_rules)
+            history = None
+            if parsed.raw.get("source") == "tbank_pdf":
+                history = {}
+                for entry in self.storage.all_budget_entries(date.min, date.max):
+                    if entry["operation_type"] != "expense":
+                        continue
+                    key = _statement_name_key(entry["name"])
+                    category, subcategory = entry["category"], entry["subcategory"]
+                    if key and category and subcategory:
+                        history.setdefault(key, set()).add((category, subcategory))
+                manual_rules = {}
+                for name, mapping in learned_rules.items():
+                    key = _statement_name_key(name)
+                    if key:
+                        manual_rules.setdefault(key, set()).add(mapping)
+                history.update(manual_rules)
+            grouped_operations = self._group_same_operations(parsed.operations, learned_rules, history)
             operation_hashes = [make_operation_hash(parsed.bank, operation) for operation in grouped_operations]
             existing_hashes = self.storage.existing_operation_hashes(operation_hashes)
             existing_entries = self._existing_entries_for_operations(grouped_operations)
@@ -66,9 +84,16 @@ class ScreenshotProcessor:
             budget_requests: List[Tuple[int, str, ParsedOperation]] = []
 
             for operation, operation_hash in zip(grouped_operations, operation_hashes):
-                if operation_hash in existing_hashes or _matches_existing_entry(parsed.bank, operation, existing_entries):
+                existing_count = sum(
+                    _matches_existing_entry(parsed.bank, operation, [entry]) for entry in existing_entries
+                )
+                if operation_hash in existing_hashes or (
+                    existing_count and (history is None or existing_count >= operation.occurrence_count)
+                ):
                     decisions.append(OperationDecision(operation, OperationStatus.IGNORED, "duplicate"))
                     continue
+                if history is not None and existing_count:
+                    operation = replace(operation, occurrence_count=operation.occurrence_count - existing_count)
 
                 status, reason = self._decide(operation)
                 record_index = len(pending)
@@ -116,17 +141,27 @@ class ScreenshotProcessor:
 
         self.storage.update_image_status(image_hash, "processed")
 
-        return ProcessingResult(image_hash=image_hash, bank=parsed.bank, decisions=decisions)
+        return ProcessingResult(
+            image_hash=image_hash, bank=parsed.bank, decisions=decisions,
+            warning=parsed.raw.get("warning"),
+        )
 
     def _apply_local_rules(
         self,
         operation: ParsedOperation,
         learned_rules: Dict[str, Tuple[str, str]],
+        history: Optional[Dict[str, set[Tuple[str, str]]]] = None,
     ) -> ParsedOperation:
         if operation.type != OperationType.EXPENSE:
             return operation
         key = merchant_key(operation.name)
         mapping = learned_rules.get(key) if key else None
+        if mapping is None and history is not None:
+            matches = history.get(_statement_name_key(operation.name), set())
+            if len(matches) > 1:
+                return replace(operation, needs_review=True)
+            if matches:
+                mapping = next(iter(matches))
         if mapping is None:
             mapping = apply_keyword_rules(operation.name, self.category_book)
         if mapping is None:
@@ -194,11 +229,12 @@ class ScreenshotProcessor:
         self,
         operations: List[ParsedOperation],
         learned_rules: Dict[str, Tuple[str, str]],
+        history: Optional[Dict[str, set[Tuple[str, str]]]] = None,
     ) -> List[ParsedOperation]:
         grouped: Dict[tuple[str, str, str, str], tuple[ParsedOperation, int]] = {}
         order: List[tuple[str, str, str, str]] = []
         for operation in operations:
-            operation = self._apply_local_rules(operation, learned_rules)
+            operation = self._apply_local_rules(operation, learned_rules, history)
             key = (
                 operation.date.isoformat(),
                 operation.type.value,
@@ -284,6 +320,10 @@ def _matches_existing_entry(bank: str, operation: ParsedOperation, entries: List
             continue
         if _amount_cents(entry.get("amount")) != operation_cents:
             continue
+        if operation.type == OperationType.EXPENSE:
+            key = _statement_name_key(operation.name)
+            if key and key == _statement_name_key(str(entry.get("name") or "")):
+                return True
         if _names_similar(operation.name, str(entry.get("name") or "")):
             return True
     return False
@@ -349,6 +389,27 @@ def _duplicate_name_key(name: str) -> str:
     key = merchant_key(name).replace("ё", "е").translate(_CYRILLIC_TO_LATIN)
     key = key.replace("yandeks", "yandex")
     return re.sub(r"[^a-z0-9]+", "", key)
+
+
+def _statement_name_key(name: str) -> str:
+    # Strip bank location suffixes; keep personal names and merchant identifiers.
+    name = re.sub(r"(?:\s+(?:rus|kazan|kazanj|arsk|moscow|moskva|g\.?))+$", "", name.casefold())
+    key = _duplicate_name_key(name)
+    aliases = {
+        "transkartru": "transportnayakarta",
+        "mupmetroelektrotrans": "metroelektrotrans",
+        "krasnoebeloe": "krasnoeibeloe",
+        "nyumi": "numi",
+        "dostavkaperekrestkas": "perekrestokdostavka",
+        "perekrestoktandem": "perekrestok",
+    }
+    key = aliases.get(key, key)
+    for chain in ("pyaterochka", "avgustina", "spar", "aptekafarmlend"):
+        if re.fullmatch(chain + r"[0-9-]*", key):
+            return chain
+    if key.startswith("surfcoffee"):
+        return "surfcoffee"
+    return key
 
 
 def _is_internal_transfer(operation: ParsedOperation) -> bool:

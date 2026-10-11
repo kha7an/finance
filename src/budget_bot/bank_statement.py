@@ -55,7 +55,7 @@ def parse_bank_statement(content: bytes) -> ParsedScreenshot:
         table = re.search(r"Номер\s+карты\s+(.*?)АО «ТБанк»", page, re.DOTALL)
         if table is None:
             raise ValueError("Не удалось прочитать таблицу выписки целиком.")
-        body = re.split(rf"{MONEY}\s+₽\s*Пополнения:", table.group(1), maxsplit=1)[0].strip()
+        body = re.split(rf"{MONEY}\s+₽\s*(?:Пополнения|Расходы):", table.group(1), maxsplit=1)[0].strip()
         if ROW.sub("", body).strip():
             raise ValueError("Не удалось прочитать все строки выписки. Ничего не записано.")
         for row in ROW.finditer(body):
@@ -82,14 +82,25 @@ def parse_bank_statement(content: bytes) -> ParsedScreenshot:
                 note=description,
             ))
 
-    # Validate bank totals before the processor can write any operations.
+    # Partial statements may lack totals, but any supplied total must agree.
+    totals_missing = False
     for label, total in (
         ("Пополнения", sum((value for value in amounts if value > 0), Decimal(0))),
         ("Расходы", -sum((value for value in amounts if value < 0), Decimal(0))),
     ):
         summary = re.search(rf"({MONEY})\s+₽\s*{label}:", text)
-        if summary is None or _money(summary[1]) != total:
-            raise ValueError("Суммы операций не совпадают с итогами выписки. Ничего не записано.")
+        if summary is None:
+            totals_missing = True
+            continue
+        expected = _money(summary[1])
+        if expected != total:
+            raise ValueError(
+                f"Суммы операций не совпадают с итогами выписки ({label}): "
+                f"прочитано {total:.2f} ₽, в выписке {expected:.2f} ₽. Ничего не записано."
+            )
     if not operations:
         raise ValueError("В выписке нет операций.")
-    return ParsedScreenshot(bank="tbank", operations=operations, raw={"source": "tbank_pdf", "operations": len(operations)})
+    raw = {"source": "tbank_pdf", "operations": len(operations)}
+    if totals_missing:
+        raw["warning"] = "В PDF нет всех итогов. Обработаны присланные страницы; полнота выписки не проверена."
+    return ParsedScreenshot(bank="tbank", operations=operations, raw=raw)

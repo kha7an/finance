@@ -80,3 +80,18 @@ def test_pdf_pipeline_passes_validated_operations_to_existing_processor(monkeypa
     assert context.parse_and_process(b"%PDF-test", "application/pdf", date(2026, 10, 8), "file-id") == "result"
     assert calls[0][2] == "file-id"
     assert calls[0][1].operations[0].amount == -1000
+
+
+@pytest.mark.parametrize("summary", ["", "0,00 ₽Пополнения:", "1 000,00 ₽Расходы:"])
+def test_statement_accepts_missing_totals_with_warning(monkeypatch, summary):
+    _pdf(monkeypatch, [HEADER + PAYMENT + summary + FOOTER])
+    parsed = parse_bank_statement(b"%PDF-test")
+    assert len(parsed.operations) == 1
+    assert parsed.operations[0].amount == -1000
+    assert "полнота выписки не проверена" in parsed.raw["warning"]
+
+
+def test_statement_checks_present_total_even_when_other_total_is_missing(monkeypatch):
+    _pdf(monkeypatch, [HEADER + PAYMENT + "999,00 ₽Расходы:" + FOOTER])
+    with pytest.raises(ValueError, match="прочитано 1000.00 ₽, в выписке 999.00 ₽"):
+        parse_bank_statement(b"%PDF-test")

@@ -1500,6 +1500,9 @@ class TelegramBot:
             self._send_message(chat_id, "Этот файл уже обработан, дубли не добавляю.")
             return
 
+        if result.warning:
+            self._send_message(chat_id, result.warning)
+
         written = [item for item in result.decisions if item.status == OperationStatus.AUTO_WRITTEN]
         pending = [item for item in result.decisions if item.status == OperationStatus.PENDING]
         ignored = [item for item in result.decisions if item.status == OperationStatus.IGNORED]
