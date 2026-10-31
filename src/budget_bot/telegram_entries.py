@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from typing import Any, Dict, Optional
 
 from .models import OperationType, ParsedOperation
-from .telegram_common import button_rows, format_money, operation_summary_text, parse_index, parse_money_amount, parse_user_operation_date
+from .telegram_common import button_rows, category_keyboard, format_money, operation_summary_text, parse_index, parse_money_amount, parse_user_operation_date
 from .telegram_reports import chart_period_payload
 
 
@@ -351,26 +351,28 @@ class TelegramEntryEditor:
         self.bot.context.storage.delete_budget_entry(entry_id)
 
     def send_entry_category_picker(self, chat_id: int, entry_id: int) -> None:
+        book = self.bot.context.category_book
         buttons = [
             {"text": category, "callback_data": f"ecat:{entry_id}:{index}"}
-            for index, (category, _subcategories) in enumerate(self.bot._category_items())
+            for index, category in enumerate(book.expense_categories)
         ]
         rows = button_rows(buttons, columns=2)
-        self.bot._send_message(chat_id, "Выбери новую категорию:", reply_markup={"inline_keyboard": rows})
+        self.bot._send_message(chat_id, "Выбери новую категорию:", reply_markup=category_keyboard(rows, book))
 
     def send_entry_subcategory_picker(self, chat_id: int, entry_id: int, category_index: int) -> None:
-        category_item = self.bot._category_by_index(category_index)
-        if category_item is None:
+        book = self.bot.context.category_book
+        items = list(book.expense_categories.items())
+        if category_index < 0 or category_index >= len(items):
             self.send_entry_category_picker(chat_id, entry_id)
             return
-        category, subcategories = category_item
+        category, subcategories = items[category_index]
         buttons = [
             {"text": subcategory, "callback_data": f"esub:{entry_id}:{category_index}:{index}"}
             for index, subcategory in enumerate(subcategories)
         ]
         rows = button_rows(buttons, columns=2)
         rows.append([{"text": "Назад", "callback_data": f"eback:{entry_id}"}])
-        self.bot._send_message(chat_id, f"Выбери подкатегорию для {category}:", reply_markup={"inline_keyboard": rows})
+        self.bot._send_message(chat_id, f"Выбери подкатегорию для {category}:", reply_markup=category_keyboard(rows, book))
 
 
 def entry_edit_pending_hash(chat_id: int) -> str:

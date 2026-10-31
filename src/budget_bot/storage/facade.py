@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
 from psycopg.types.json import Jsonb
 
-from ..categories import CategoryBook
+from ..categories import CategoryBook, validate_category_name
 from ..analytics import previous_period
 from ..default_categories import DEFAULT_EXPENSE_CATEGORIES, DEFAULT_INCOME_CATEGORIES
 from ..migrations.runner import upgrade_head
@@ -154,6 +154,185 @@ class Storage(DbConnection):
             expense_categories.setdefault(row["category"], []).append(row["subcategory"])
         income_categories = [row["name"] for row in category_rows if row["kind"] == "income"]
         return CategoryBook(expense_categories=expense_categories, income_categories=income_categories)
+
+    def category_catalog(self) -> List[Dict[str, Any]]:
+        self.ensure_owner()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, kind, name FROM categories WHERE owner_id = %s ORDER BY sort_order, id",
+                (self.owner_id,),
+            ).fetchall()
+            children = connection.execute(
+                """SELECT s.id, s.category_id, s.name FROM subcategories s
+                   JOIN categories c ON c.id = s.category_id WHERE c.owner_id = %s
+                   ORDER BY s.sort_order, s.id""", (self.owner_id,),
+            ).fetchall()
+        return [{**dict(row), "subcategories": [dict(s) for s in children if s["category_id"] == row["id"]]} for row in rows]
+
+    def _lock_category_owner(self, connection) -> None:
+        connection.execute("SELECT owner_id FROM users WHERE owner_id = %s FOR UPDATE", (self.owner_id,)).fetchone()
+
+    def _check_category_edit_busy(self, connection) -> None:
+        # A parser may still be using the catalog snapshot sent to the LLM.
+        job = connection.execute("SELECT 1 FROM parse_jobs WHERE owner_id = %s AND status = 'running' LIMIT 1", (self.owner_id,)).fetchone()
+        image = connection.execute("SELECT 1 FROM source_images WHERE owner_id = %s AND status = 'processing' LIMIT 1", (self.owner_id,)).fetchone()
+        if job or image:
+            raise ValueError("Дождись окончания обработки файлов, затем измени категорию.")
+
+    def _category_target(self, connection, category_id: int, subcategory_id: Optional[int] = None):
+        category = connection.execute(
+            "SELECT id, kind, name FROM categories WHERE owner_id = %s AND id = %s FOR UPDATE",
+            (self.owner_id, category_id),
+        ).fetchone()
+        if category is None:
+            raise ValueError("Категория не найдена. Открой список заново.")
+        subcategory = None
+        if subcategory_id is not None:
+            subcategory = connection.execute(
+                "SELECT id, name FROM subcategories WHERE category_id = %s AND id = %s FOR UPDATE",
+                (category_id, subcategory_id),
+            ).fetchone()
+            if subcategory is None:
+                raise ValueError("Подкатегория не найдена. Открой список заново.")
+        return category, subcategory
+
+    def _check_category_name(self, connection, kind: str, name: str, category_id: Optional[int] = None, exclude_id: Optional[int] = None) -> None:
+        if category_id is None:
+            rows = connection.execute("SELECT id, name FROM categories WHERE owner_id = %s AND kind = %s", (self.owner_id, kind)).fetchall()
+        else:
+            rows = connection.execute("SELECT id, name FROM subcategories WHERE category_id = %s", (category_id,)).fetchall()
+        if any(row["id"] != exclude_id and row["name"].casefold() == name.casefold() for row in rows):
+            raise ValueError("Такое название уже есть.")
+
+    def create_category(self, kind: str, name: str) -> int:
+        name = validate_category_name(name)
+        if kind not in {"expense", "income"}:
+            raise ValueError("Неизвестный тип категории.")
+        self.ensure_owner()
+        timestamp = now_iso()
+        with self._connect() as connection:
+            self._lock_category_owner(connection)
+            self._check_category_name(connection, kind, name)
+            row = connection.execute(
+                """INSERT INTO categories (owner_id, kind, name, sort_order, created_at, updated_at)
+                   SELECT %s, %s, %s, COALESCE(MAX(sort_order), -1) + 1, %s, %s
+                   FROM categories WHERE owner_id = %s AND kind = %s RETURNING id""",
+                (self.owner_id, kind, name, timestamp, timestamp, self.owner_id, kind),
+            ).fetchone()
+            category_id = int(row["id"])
+            if kind == "expense":
+                connection.execute(
+                    "INSERT INTO subcategories (category_id, name, sort_order, created_at, updated_at) VALUES (%s, 'Разное', 0, %s, %s)",
+                    (category_id, timestamp, timestamp),
+                )
+        return category_id
+
+    def create_subcategory(self, category_id: int, name: str) -> None:
+        name = validate_category_name(name)
+        timestamp = now_iso()
+        with self._connect() as connection:
+            self._lock_category_owner(connection)
+            category, _ = self._category_target(connection, category_id)
+            if category["kind"] != "expense":
+                raise ValueError("У категорий доходов нет подкатегорий.")
+            self._check_category_name(connection, "expense", name, category_id)
+            connection.execute(
+                """INSERT INTO subcategories (category_id, name, sort_order, created_at, updated_at)
+                   SELECT %s, %s, COALESCE(MAX(sort_order), -1) + 1, %s, %s
+                   FROM subcategories WHERE category_id = %s""",
+                (category_id, name, timestamp, timestamp, category_id),
+            )
+
+    def rename_category(self, category_id: int, name: str, subcategory_id: Optional[int] = None) -> None:
+        name = validate_category_name(name)
+        with self._connect() as connection:
+            self._lock_category_owner(connection)
+            self._check_category_edit_busy(connection)
+            category, subcategory = self._category_target(connection, category_id, subcategory_id)
+            self._check_category_name(connection, category["kind"], name, category_id if subcategory else None, subcategory_id if subcategory else category_id)
+            column = "subcategory" if subcategory else "category"
+            where = "owner_id = %s AND operation_type = %s AND category = %s"
+            params = [self.owner_id, category["kind"], category["name"]]
+            json_where = "owner_id = %s AND operation_json->>'type' = %s AND operation_json->>'category' = %s"
+            if subcategory:
+                where += " AND subcategory = %s"
+                json_where += " AND operation_json->>'subcategory' = %s"
+                params.append(subcategory["name"])
+            connection.execute(f"UPDATE budget_entries SET {column} = %s, updated_at = %s WHERE {where}", [name, now_iso(), *params])
+            connection.execute(
+                f"UPDATE operations SET operation_json = jsonb_set(operation_json, %s, %s) WHERE {json_where}",
+                [[column], Jsonb(name), *params],
+            )
+            if category["kind"] == "expense":
+                rule_where = "owner_id = %s AND category = %s" + (" AND subcategory = %s" if subcategory else "")
+                rule_params = [self.owner_id, category["name"]] + ([subcategory["name"]] if subcategory else [])
+                connection.execute(f"UPDATE learned_expense_categories SET {column} = %s, updated_at = %s WHERE {rule_where}", [name, now_iso(), *rule_params])
+                settings = connection.execute("SELECT mandatory_rules, limits FROM analytics_settings WHERE owner_id = %s FOR UPDATE", (self.owner_id,)).fetchone()
+                if settings:
+                    rules = []
+                    for old_category, old_subcategory in settings["mandatory_rules"]:
+                        if old_category == category["name"] and (not subcategory or old_subcategory == subcategory["name"]):
+                            if subcategory:
+                                old_subcategory = name
+                            else:
+                                old_category = name
+                        rules.append([old_category, old_subcategory])
+                    limits = dict(settings["limits"])
+                    if not subcategory and category["name"] in limits:
+                        limits[name] = limits.pop(category["name"])
+                    connection.execute("UPDATE analytics_settings SET mandatory_rules = %s, limits = %s WHERE owner_id = %s", (Jsonb(rules), Jsonb(limits), self.owner_id))
+            pending_rows = connection.execute("SELECT operation_hash, prompt FROM pending_actions WHERE owner_id = %s AND prompt LIKE 'manual:%%' FOR UPDATE", (self.owner_id,)).fetchall()
+            for pending in pending_rows:
+                try:
+                    state = json.loads(pending["prompt"][7:])
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(state, dict) or state.get("type") != category["kind"] or state.get("category") != category["name"]:
+                    continue
+                if subcategory and state.get("subcategory") != subcategory["name"]:
+                    continue
+                state[column] = name
+                connection.execute("UPDATE pending_actions SET prompt = %s WHERE owner_id = %s AND operation_hash = %s", ("manual:" + json.dumps(state, ensure_ascii=False), self.owner_id, pending["operation_hash"]))
+            if subcategory:
+                connection.execute("UPDATE subcategories SET name = %s, updated_at = %s WHERE id = %s AND category_id = %s", (name, now_iso(), subcategory_id, category_id))
+            else:
+                connection.execute("UPDATE categories SET name = %s, updated_at = %s WHERE id = %s AND owner_id = %s", (name, now_iso(), category_id, self.owner_id))
+
+    def delete_category(self, category_id: int, subcategory_id: Optional[int] = None) -> None:
+        with self._connect() as connection:
+            self._lock_category_owner(connection)
+            self._check_category_edit_busy(connection)
+            category, subcategory = self._category_target(connection, category_id, subcategory_id)
+            where = "owner_id = %s AND operation_type = %s AND category = %s"
+            json_where = "owner_id = %s AND operation_json->>'type' = %s AND operation_json->>'category' = %s"
+            params = [self.owner_id, category["kind"], category["name"]]
+            if subcategory:
+                where += " AND subcategory = %s"
+                json_where += " AND operation_json->>'subcategory' = %s"
+                params.append(subcategory["name"])
+            used = connection.execute(f"SELECT 1 FROM budget_entries WHERE {where} LIMIT 1", params).fetchone()
+            used = used or connection.execute(f"SELECT 1 FROM operations WHERE {json_where} LIMIT 1", params).fetchone()
+            if category["kind"] == "expense":
+                rule_where = "owner_id = %s AND category = %s" + (" AND subcategory = %s" if subcategory else "")
+                rule_params = [self.owner_id, category["name"]] + ([subcategory["name"]] if subcategory else [])
+                used = used or connection.execute(f"SELECT 1 FROM learned_expense_categories WHERE {rule_where} LIMIT 1", rule_params).fetchone()
+                settings = connection.execute("SELECT mandatory_rules, limits FROM analytics_settings WHERE owner_id = %s", (self.owner_id,)).fetchone()
+                if settings:
+                    used = used or (not subcategory and category["name"] in settings["limits"]) or any(c == category["name"] and (not subcategory or s == subcategory["name"]) for c, s in settings["mandatory_rules"])
+            if used:
+                raise ValueError("Категория используется в операциях, правилах или аналитике. Удаление недоступно.")
+            if connection.execute("SELECT 1 FROM pending_actions WHERE owner_id = %s AND operation_hash NOT LIKE 'catalog-%%' LIMIT 1", (self.owner_id,)).fetchone():
+                raise ValueError("Сначала заверши текущие операции и ручной ввод, затем удали категорию.")
+            if subcategory:
+                count = connection.execute("SELECT COUNT(*) AS count FROM subcategories WHERE category_id = %s", (category_id,)).fetchone()["count"]
+                if count <= 1:
+                    raise ValueError("Нельзя удалить последнюю подкатегорию. Добавь другую или удали категорию целиком.")
+                connection.execute("DELETE FROM subcategories WHERE id = %s AND category_id = %s", (subcategory_id, category_id))
+            else:
+                count = connection.execute("SELECT COUNT(*) AS count FROM categories WHERE owner_id = %s AND kind = %s", (self.owner_id, category["kind"])).fetchone()["count"]
+                if count <= 1:
+                    raise ValueError("Нельзя удалить последнюю категорию этого типа.")
+                connection.execute("DELETE FROM categories WHERE id = %s AND owner_id = %s", (category_id, self.owner_id))
 
     def set_budget_account(
         self,

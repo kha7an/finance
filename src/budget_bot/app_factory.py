@@ -61,6 +61,7 @@ class AppContext:
         owner_id = self.owner_id
         cached = self._runtime_cache.get(owner_id)
         if cached is not None:
+            cached.processor.category_book = self.storage.category_book()
             return cached
         runtime = BudgetRuntime(
             processor=ScreenshotProcessor(

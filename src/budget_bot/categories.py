@@ -4,6 +4,13 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 
+def validate_category_name(value: str) -> str:
+    name = value.strip()
+    if not name or len(name) > 64 or "/" in name or any(ord(char) < 32 for char in name):
+        raise ValueError("Название должно содержать от 1 до 64 символов, без / и переносов строк.")
+    return name
+
+
 @dataclass(frozen=True)
 class CategoryBook:
     expense_categories: Dict[str, List[str]]

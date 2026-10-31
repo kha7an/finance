@@ -1,10 +1,30 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from datetime import date
 from typing import Dict, Optional, Sequence
 
 from .models import OperationType, ParsedOperation
+
+
+CATEGORY_CALLBACK_ACTIONS = {"cat", "sub", "incat", "mcat", "msub", "mincat", "ecat", "esub"}
+
+
+def category_token(category_book) -> str:
+    payload = [list(category_book.expense_categories.items()), category_book.income_categories]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()[:8]
+
+
+def category_keyboard(rows, category_book) -> dict:
+    token = category_token(category_book)
+    for row in rows:
+        for button in row:
+            data = button.get("callback_data", "")
+            if data.split(":", 1)[0] in CATEGORY_CALLBACK_ACTIONS:
+                button["callback_data"] = f"{data}~{token}"
+    return {"inline_keyboard": rows}
 
 
 def button_rows(buttons: Sequence[Dict[str, str]], columns: int) -> list[list[Dict[str, str]]]:

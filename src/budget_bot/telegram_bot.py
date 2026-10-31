@@ -25,6 +25,9 @@ from .telegram_api import (
     TelegramApiError,
 )
 from .telegram_common import (
+    CATEGORY_CALLBACK_ACTIONS,
+    category_token,
+    category_keyboard,
     button_rows as _button_rows,
     format_money as _format_money,
     operation_summary_text as _operation_summary_text,
@@ -38,6 +41,7 @@ from .telegram_manual import (
     is_manual_pending,
     parse_manual_operation_text as _parse_manual_operation_text,
 )
+from .telegram_categories import TelegramCategories
 from .telegram_reports import expense_report_lines as _expense_report_lines
 from .telegram_reports import parse_stats_period as _parse_stats_period
 from .telegram_reports import chart_period_payload as _chart_period_payload
@@ -305,6 +309,30 @@ class TelegramBot:
             self._answer_callback(callback["id"], "Не понял действие")
             return
 
+        if action == "catalog":
+            TelegramCategories(self).handle_callback(callback, chat_id, payload)
+            return
+
+        if action in CATEGORY_CALLBACK_ACTIONS:
+            parts = payload.rsplit("~", 1)
+            if len(parts) != 2 or parts[1] != category_token(self.context.category_book):
+                self._answer_callback(callback["id"], "Справочник изменился. Выбери категорию заново.")
+                original = parts[0]
+                if action in {"mcat", "msub", "mincat"}:
+                    keyboard = self._manual_income_category_keyboard(chat_id) if action == "mincat" else self._manual_category_keyboard(chat_id)
+                    self._send_message(chat_id, "Выбери категорию заново:", reply_markup=keyboard)
+                elif action in {"ecat", "esub"}:
+                    entry_id = _parse_index(original, 0)
+                    if entry_id is not None:
+                        self._entry_editor().send_entry_category_picker(chat_id, entry_id)
+                elif action == "incat":
+                    self._send_income_category_picker(chat_id, original.split(":", 1)[0])
+                else:
+                    self._send_category_picker(chat_id, original.split(":", 1)[0])
+                self._delete_callback_message(callback)
+                return
+            payload = parts[0]
+
         if action in {"reset", "reset_confirm", "reset_cancel"}:
             self._handle_reset_callback(callback, chat_id, action)
             return
@@ -462,10 +490,15 @@ class TelegramBot:
     def _handle_text(self, message: Dict[str, Any]) -> None:
         chat_id = message["chat"]["id"]
         text = str(message.get("text", "")).strip()
+        if text == "Категории" or (text and text.split(maxsplit=1)[0].split("@")[0] == "/categories"):
+            TelegramCategories(self).open(chat_id)
+            return
+        if TelegramCategories(self).handle_text(chat_id, text):
+            return
         if text.startswith("/start") or text.startswith("/help"):
             self._send_message(
                 chat_id,
-                "Готов. Пришли скриншот истории операций или PDF-выписку Т-Банка, я обработаю её и запишу в бюджет.",
+                "Готов. Пришли скриншот истории операций или PDF-выписку Т-Банка, я обработаю её и запишу в бюджет.\nКатегории: /categories",
                 reply_markup=self._main_reply_keyboard(),
             )
             return
@@ -1292,6 +1325,7 @@ class TelegramBot:
         return {
             "keyboard": [
                 [{"text": "Расход"}, {"text": "Доход"}],
+                [{"text": "Категории"}],
                 [{"text": "Аналитика"}, {"text": "Синхронизировать"}, {"text": "Сброс"}],
             ],
             "resize_keyboard": True,
@@ -1387,13 +1421,14 @@ class TelegramBot:
         )
 
     def _category_keyboard(self, operation_hash: str) -> Dict[str, Any]:
+        book = self.context.category_book
         buttons = [
             {"text": category, "callback_data": f"cat:{operation_hash}:{index}"}
-            for index, (category, _subcategories) in enumerate(self._category_items())
+            for index, category in enumerate(book.expense_categories)
         ]
         rows = _button_rows(buttons, columns=2)
         rows.append([{"text": "Пропустить", "callback_data": f"skip:{operation_hash}"}])
-        return {"inline_keyboard": rows}
+        return category_keyboard(rows, book)
 
     def _quantity_keyboard(self, operation_hash: str, count: int) -> Dict[str, Any]:
         buttons = [
@@ -1405,13 +1440,14 @@ class TelegramBot:
         return {"inline_keyboard": rows}
 
     def _income_category_keyboard(self, operation_hash: str) -> Dict[str, Any]:
+        book = self.context.category_book
         buttons = [
             {"text": category, "callback_data": f"incat:{operation_hash}:{index}"}
-            for index, category in enumerate(self.context.category_book.income_categories)
+            for index, category in enumerate(book.income_categories)
         ]
         rows = _button_rows(buttons, columns=2)
         rows.append([{"text": "Пропустить", "callback_data": f"skip:{operation_hash}"}])
-        return {"inline_keyboard": rows}
+        return category_keyboard(rows, book)
 
     def _manual_category_keyboard(self, chat_id: int) -> Dict[str, Any]:
         return self._manual_entry().category_keyboard(chat_id)
@@ -1446,10 +1482,11 @@ class TelegramBot:
         }
 
     def _subcategory_keyboard(self, operation_hash: str, category_index: int) -> Dict[str, Any]:
-        category_item = self._category_by_index(category_index)
-        if category_item is None:
+        book = self.context.category_book
+        items = list(book.expense_categories.items())
+        if category_index < 0 or category_index >= len(items):
             return self._category_keyboard(operation_hash)
-        _category, subcategories = category_item
+        _category, subcategories = items[category_index]
         buttons = [
             {"text": subcategory, "callback_data": f"sub:{operation_hash}:{category_index}:{index}"}
             for index, subcategory in enumerate(subcategories)
@@ -1461,7 +1498,7 @@ class TelegramBot:
                 {"text": "Пропустить", "callback_data": f"skip:{operation_hash}"},
             ]
         )
-        return {"inline_keyboard": rows}
+        return category_keyboard(rows, book)
 
     def _category_items(self) -> List[tuple[str, List[str]]]:
         return list(self.context.category_book.expense_categories.items())

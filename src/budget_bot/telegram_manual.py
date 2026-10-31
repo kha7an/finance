@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 from .models import OperationStatus, OperationType, ParsedOperation
 from .storage import operation_hash as make_operation_hash
-from .telegram_common import button_rows, parse_index, parse_money_amount, parse_user_operation_date
+from .telegram_common import button_rows, category_keyboard, parse_index, parse_money_amount, parse_user_operation_date
 
 
 MANUAL_ACTIONS = {"mtoday", "mcat", "msub", "mincat", "mcancel"}
@@ -241,38 +241,41 @@ class TelegramManualEntry:
         )
 
     def category_keyboard(self, chat_id: int) -> Dict[str, Any]:
+        book = self.bot.context.category_book
         pending_hash = manual_pending_hash(chat_id)
         buttons = [
             {"text": category, "callback_data": f"mcat:{pending_hash}:{index}"}
-            for index, (category, _subcategories) in enumerate(self.bot._category_items())
+            for index, category in enumerate(book.expense_categories)
         ]
         rows = button_rows(buttons, columns=2)
         rows.append([{"text": "Отмена", "callback_data": f"mcancel:{pending_hash}"}])
-        return {"inline_keyboard": rows}
+        return category_keyboard(rows, book)
 
     def subcategory_keyboard(self, chat_id: int, category_index: int) -> Dict[str, Any]:
-        category_item = self.bot._category_by_index(category_index)
-        if category_item is None:
+        book = self.bot.context.category_book
+        items = list(book.expense_categories.items())
+        if category_index < 0 or category_index >= len(items):
             return self.category_keyboard(chat_id)
         pending_hash = manual_pending_hash(chat_id)
-        _category, subcategories = category_item
+        _category, subcategories = items[category_index]
         buttons = [
             {"text": subcategory, "callback_data": f"msub:{pending_hash}:{category_index}:{index}"}
             for index, subcategory in enumerate(subcategories)
         ]
         rows = button_rows(buttons, columns=2)
         rows.append([{"text": "Отмена", "callback_data": f"mcancel:{pending_hash}"}])
-        return {"inline_keyboard": rows}
+        return category_keyboard(rows, book)
 
     def income_category_keyboard(self, chat_id: int) -> Dict[str, Any]:
+        book = self.bot.context.category_book
         pending_hash = manual_pending_hash(chat_id)
         buttons = [
             {"text": category, "callback_data": f"mincat:{pending_hash}:{index}"}
-            for index, category in enumerate(self.bot.context.category_book.income_categories)
+            for index, category in enumerate(book.income_categories)
         ]
         rows = button_rows(buttons, columns=2)
         rows.append([{"text": "Отмена", "callback_data": f"mcancel:{pending_hash}"}])
-        return {"inline_keyboard": rows}
+        return category_keyboard(rows, book)
 
 
 def manual_pending_hash(chat_id: int) -> str:
