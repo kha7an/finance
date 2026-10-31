@@ -73,6 +73,10 @@ def operation_summary_text(operation: ParsedOperation) -> str:
 
 
 def category_summary(operation: ParsedOperation) -> str:
+    if operation.type == OperationType.REIMBURSEMENT:
+        return "возмещение"
+    if operation.type == OperationType.TRANSFER:
+        return "перевод между своими"
     if operation.type == OperationType.INCOME:
         return operation.category or "доход"
     if operation.category and operation.subcategory:

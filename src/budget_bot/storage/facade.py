@@ -15,6 +15,7 @@ from ..default_categories import DEFAULT_EXPENSE_CATEGORIES, DEFAULT_INCOME_CATE
 from ..migrations.runner import upgrade_head
 from ..models import OperationStatus, OperationType, ParsedOperation
 from .connection import DbConnection
+from .features import BudgetFeatures, _snapshot
 from .helpers import (
     DEFAULT_OWNER_ID,
     entry_row,
@@ -52,7 +53,7 @@ class BudgetEntryInsert:
     bank: str
 
 
-class Storage(DbConnection):
+class Storage(BudgetFeatures, DbConnection):
     def __init__(self, database_url: str) -> None:
         super().__init__(database_url)
         self._init_db()
@@ -65,6 +66,9 @@ class Storage(DbConnection):
 
     @contextmanager
     def _connect(self):
+        if _snapshot.get() is not None:
+            yield _snapshot.get()
+            return
         with self.connect() as connection:
             yield connection
 
@@ -90,6 +94,10 @@ class Storage(DbConnection):
             ).fetchone()
             if exists is None:
                 self._insert_default_categories(connection, owner_id)
+            if not owner_id.startswith("shared:"):
+                connection.execute(
+                    "INSERT INTO budget_members VALUES (%s,%s,'owner') ON CONFLICT DO NOTHING", (owner_id, owner_id)
+                )
 
     def _insert_default_categories(self, connection, owner_id: str) -> None:
         timestamp = now_iso()
@@ -104,6 +112,9 @@ class Storage(DbConnection):
                 (owner_id, category, category_order, timestamp, timestamp),
             ).fetchone()
             category_id = row["id"]
+            connection.execute(
+                "UPDATE categories SET color='#' || substr(md5(id::text),1,6) WHERE id=%s", (category_id,)
+            )
             for subcategory_order, subcategory in enumerate(subcategories):
                 connection.execute(
                     """
@@ -159,7 +170,7 @@ class Storage(DbConnection):
         self.ensure_owner()
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT id, kind, name FROM categories WHERE owner_id = %s ORDER BY sort_order, id",
+                "SELECT id, kind, name, color FROM categories WHERE owner_id = %s ORDER BY sort_order, id",
                 (self.owner_id,),
             ).fetchall()
             children = connection.execute(
@@ -170,7 +181,8 @@ class Storage(DbConnection):
         return [{**dict(row), "subcategories": [dict(s) for s in children if s["category_id"] == row["id"]]} for row in rows]
 
     def _lock_category_owner(self, connection) -> None:
-        connection.execute("SELECT owner_id FROM users WHERE owner_id = %s FOR UPDATE", (self.owner_id,)).fetchone()
+        self._lock_budget(connection)
+        self._require_owner(connection)
 
     def _check_category_edit_busy(self, connection) -> None:
         # A parser may still be using the catalog snapshot sent to the LLM.
@@ -181,7 +193,7 @@ class Storage(DbConnection):
 
     def _category_target(self, connection, category_id: int, subcategory_id: Optional[int] = None):
         category = connection.execute(
-            "SELECT id, kind, name FROM categories WHERE owner_id = %s AND id = %s FOR UPDATE",
+            "SELECT id, kind, name, color FROM categories WHERE owner_id = %s AND id = %s FOR UPDATE",
             (self.owner_id, category_id),
         ).fetchone()
         if category is None:
@@ -220,6 +232,9 @@ class Storage(DbConnection):
                 (self.owner_id, kind, name, timestamp, timestamp, self.owner_id, kind),
             ).fetchone()
             category_id = int(row["id"])
+            connection.execute(
+                "UPDATE categories SET color = '#' || substr(md5(id::text), 1, 6) WHERE id=%s", (category_id,)
+            )
             if kind == "expense":
                 connection.execute(
                     "INSERT INTO subcategories (category_id, name, sort_order, created_at, updated_at) VALUES (%s, 'Разное', 0, %s, %s)",
@@ -259,6 +274,7 @@ class Storage(DbConnection):
                 json_where += " AND operation_json->>'subcategory' = %s"
                 params.append(subcategory["name"])
             connection.execute(f"UPDATE budget_entries SET {column} = %s, updated_at = %s WHERE {where}", [name, now_iso(), *params])
+            connection.execute(f"UPDATE recurring_templates SET {column}=%s WHERE {where}", [name, *params])
             connection.execute(
                 f"UPDATE operations SET operation_json = jsonb_set(operation_json, %s, %s) WHERE {json_where}",
                 [[column], Jsonb(name), *params],
@@ -311,6 +327,12 @@ class Storage(DbConnection):
                 json_where += " AND operation_json->>'subcategory' = %s"
                 params.append(subcategory["name"])
             used = connection.execute(f"SELECT 1 FROM budget_entries WHERE {where} LIMIT 1", params).fetchone()
+            used = (
+                used
+                or connection.execute(
+                    f"SELECT 1 FROM recurring_templates WHERE {where} AND NOT deleted LIMIT 1", params
+                ).fetchone()
+            )
             used = used or connection.execute(f"SELECT 1 FROM operations WHERE {json_where} LIMIT 1", params).fetchone()
             if category["kind"] == "expense":
                 rule_where = "owner_id = %s AND category = %s" + (" AND subcategory = %s" if subcategory else "")
@@ -454,12 +476,13 @@ class Storage(DbConnection):
             connection.execute(
                 """
                 INSERT INTO operations
-                    (owner_id, operation_hash, image_hash, bank, operation_json, status, workbook_row, status_note, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (owner_id, author_id, operation_hash, image_hash, bank, operation_json, status, workbook_row, status_note, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT(owner_id, operation_hash) DO NOTHING
                 """,
                 (
                     self.owner_id,
+                    self.actor_id,
                     operation_hash,
                     image_hash,
                     bank,
@@ -480,10 +503,11 @@ class Storage(DbConnection):
         params: List[Any] = []
         value_rows: List[str] = []
         for record in items:
-            value_rows.append("(%s, %s, %s, %s, %s, %s, %s, %s, %s)")
+            value_rows.append("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
             params.extend(
                 [
                     self.owner_id,
+                    self.actor_id,
                     record.operation_hash,
                     record.image_hash,
                     record.bank,
@@ -498,7 +522,7 @@ class Storage(DbConnection):
             connection.execute(
                 f"""
                 INSERT INTO operations
-                    (owner_id, operation_hash, image_hash, bank, operation_json, status, workbook_row, status_note, created_at)
+                    (owner_id, author_id, operation_hash, image_hash, bank, operation_json, status, workbook_row, status_note, created_at)
                 VALUES {", ".join(value_rows)}
                 ON CONFLICT(owner_id, operation_hash) DO NOTHING
                 """,
@@ -608,6 +632,13 @@ class Storage(DbConnection):
 
     def reset_all(self) -> None:
         with self._connect() as connection:
+            self._lock_budget(connection)
+            self._require_owner(connection)
+            connection.execute("DELETE FROM recurring_instances WHERE owner_id=%s", (self.owner_id,))
+            connection.execute(
+                "UPDATE budget_entries SET expense_entry_id=NULL,operation_type='transfer' WHERE owner_id=%s AND operation_type='reimbursement'",
+                (self.owner_id,),
+            )
             for table in [
                 "parse_jobs",
                 "pending_actions",
@@ -643,11 +674,11 @@ class Storage(DbConnection):
                 """
                 INSERT INTO budget_entries
                     (
-                        owner_id, source, operation_hash, export_sheet, export_row,
+                        owner_id, author_id, source, operation_hash, export_sheet, export_row,
                         operation_date, operation_type, amount, category, subcategory,
                         name, note, bank, created_at, updated_at
                     )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT(owner_id, operation_hash, export_row) DO UPDATE SET
                     source = excluded.source,
                     export_sheet = excluded.export_sheet,
@@ -662,6 +693,7 @@ class Storage(DbConnection):
                 """,
                 (
                     self.owner_id,
+                    self.actor_id,
                     source,
                     operation_hash or f"manual:{self.owner_id}:{timestamp}:{operation.name}",
                     workbook_sheet,
@@ -692,14 +724,15 @@ class Storage(DbConnection):
                 """
                 INSERT INTO budget_entries
                     (
-                        owner_id, source, operation_hash, operation_date, operation_type,
+                        owner_id, author_id, source, operation_hash, operation_date, operation_type,
                         amount, category, subcategory, name, note, bank, created_at, updated_at
                     )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (
                     self.owner_id,
+                    self.actor_id,
                     source,
                     operation_hash or f"manual:{self.owner_id}:{timestamp}:{operation.name}",
                     operation.date,
@@ -725,10 +758,11 @@ class Storage(DbConnection):
         value_rows: List[str] = []
         for entry in items:
             resolved_hash = entry.operation_hash or f"manual:{self.owner_id}:{timestamp}:{entry.operation.name}"
-            value_rows.append("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
+            value_rows.append("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)")
             params.extend(
                 [
                     self.owner_id,
+                    self.actor_id,
                     entry.source,
                     resolved_hash,
                     entry.operation.date,
@@ -744,11 +778,22 @@ class Storage(DbConnection):
                 ]
             )
         with self._connect() as connection:
+            self._lock_budget(connection)
+            hashes = [entry.operation_hash for entry in items]
+            existing = connection.execute(
+                "SELECT id, operation_hash FROM budget_entries WHERE owner_id=%s AND operation_hash=ANY(%s)",
+                (self.owner_id, hashes),
+            ).fetchall()
+            if existing:
+                by_hash = {row["operation_hash"]: row["id"] for row in existing}
+                if all(key in by_hash for key in hashes):
+                    return [by_hash[key] for key in hashes]
+                raise ValueError("Часть операций уже записана; обнови результат импорта.")
             rows = connection.execute(
                 f"""
                 INSERT INTO budget_entries
                     (
-                        owner_id, source, operation_hash, operation_date, operation_type,
+                        owner_id, author_id, source, operation_hash, operation_date, operation_type,
                         amount, category, subcategory, name, note, bank, created_at, updated_at
                     )
                 VALUES {", ".join(value_rows)}
@@ -762,15 +807,23 @@ class Storage(DbConnection):
         rows = list(entries)
         timestamp = now_iso()
         with self._connect() as connection:
+            self._lock_budget(connection)
+            self._require_owner(connection)
+            if connection.execute(
+                "SELECT 1 FROM budget_entries WHERE owner_id=%s AND expense_entry_id IS NOT NULL UNION ALL SELECT 1 FROM recurring_instances WHERE owner_id=%s LIMIT 1",
+                (self.owner_id, self.owner_id),
+            ).fetchone():
+                raise ValueError("Замена истории недоступна при наличии возвратов или регулярных платежей.")
             connection.execute("DELETE FROM budget_entries WHERE owner_id = %s", (self.owner_id,))
             if rows:
                 params: List[Any] = []
                 value_rows: List[str] = []
                 for entry in rows:
-                    value_rows.append("(" + ", ".join(["%s"] * 15) + ")")
+                    value_rows.append("(" + ", ".join(["%s"] * 16) + ")")
                     params.extend(
                         [
                             self.owner_id,
+                            self.actor_id,
                             entry.get("source", "import"),
                             entry.get("operation_hash"),
                             entry.get("workbook_sheet") or entry.get("export_sheet"),
@@ -791,7 +844,7 @@ class Storage(DbConnection):
                     f"""
                     INSERT INTO budget_entries
                         (
-                            owner_id, source, operation_hash, export_sheet, export_row,
+                            owner_id, author_id, source, operation_hash, export_sheet, export_row,
                             operation_date, operation_type, amount, category, subcategory,
                             name, note, bank, created_at, updated_at
                         )
@@ -806,16 +859,27 @@ class Storage(DbConnection):
             row = connection.execute(
                 "SELECT * FROM analytics_settings WHERE owner_id = %s", (self.owner_id,),
             ).fetchone()
-        return dict(row) if row else {
-            "exclude_mandatory": False, "mandatory_rules": [], "limits": {},
-            "weekly_enabled": False, "weekly_chat_id": None,
-        }
+        return (
+            dict(row)
+            if row
+            else {
+                "exclude_mandatory": False,
+                "mandatory_rules": [],
+                "limits": {},
+                "weekly_enabled": False,
+                "weekly_chat_id": None,
+                "period_day": 1,
+                "opening_amount": 0,
+            }
+        )
 
     def update_analytics_settings(self, **changes: Any) -> None:
         allowed = {"exclude_mandatory", "weekly_enabled", "weekly_chat_id"}
         if not changes or not set(changes) <= allowed:
             raise ValueError("Invalid analytics settings")
         with self._connect() as connection:
+            self._lock_budget(connection)
+            self._require_owner(connection)
             connection.execute(
                 "INSERT INTO analytics_settings (owner_id) VALUES (%s) ON CONFLICT DO NOTHING",
                 (self.owner_id,),
@@ -829,6 +893,8 @@ class Storage(DbConnection):
 
     def toggle_mandatory_rule(self, category: str, subcategory: str = "") -> None:
         with self._connect() as connection:
+            self._lock_budget(connection)
+            self._require_owner(connection)
             connection.execute(
                 "INSERT INTO analytics_settings (owner_id) VALUES (%s) ON CONFLICT DO NOTHING",
                 (self.owner_id,),
@@ -855,6 +921,8 @@ class Storage(DbConnection):
         if amount > 0 and rounded == 0:
             raise ValueError("Limit must be at least one kopek")
         with self._connect() as connection:
+            self._lock_budget(connection)
+            self._require_owner(connection)
             connection.execute(
                 "INSERT INTO analytics_settings (owner_id) VALUES (%s) ON CONFLICT DO NOTHING",
                 (self.owner_id,),
@@ -873,6 +941,13 @@ class Storage(DbConnection):
 
     def toggle_mandatory_entry(self, entry_id: int) -> bool:
         with self._connect() as connection:
+            self._lock_budget(connection)
+            entry = connection.execute(
+                "SELECT * FROM budget_entries WHERE owner_id=%s AND id=%s", (self.owner_id, entry_id)
+            ).fetchone()
+            if entry is None:
+                return False
+            self._require_edit(connection, entry)
             row = connection.execute(
                 """UPDATE budget_entries SET is_mandatory = NOT is_mandatory
                    WHERE owner_id = %s AND id = %s AND operation_type = 'expense'
@@ -884,11 +959,14 @@ class Storage(DbConnection):
         with self._connect() as connection:
             rows = connection.execute(
                 """SELECT operation_date, operation_type, category, subcategory, is_mandatory,
-                          SUM(amount) AS total, COUNT(*) AS count
-                   FROM budget_entries
+                          SUM(CASE WHEN operation_type='expense' THEN personal_amount ELSE amount END) AS total,
+                          SUM(CASE WHEN operation_type='expense' THEN amount ELSE 0 END) AS paid,
+                          SUM(returned_amount) AS returned, COUNT(*) AS count
+                   FROM effective_entries
                    WHERE owner_id = %s AND operation_date BETWEEN %s AND %s
                    GROUP BY operation_date, operation_type, category, subcategory, is_mandatory
-                   ORDER BY operation_date""", (self.owner_id, start_date, end_date),
+                   ORDER BY operation_date""",
+                (self.owner_id, start_date, end_date),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -982,10 +1060,11 @@ class Storage(DbConnection):
             total_row = connection.execute(
                 f"""
                 SELECT
-                    COALESCE(SUM(amount), 0) AS total,
+                    COALESCE(SUM(personal_amount), 0) AS total,
+                    COALESCE(SUM(returned_amount), 0) AS adjustment,
                     COUNT(*) AS count,
                     COUNT(DISTINCT operation_date) AS active_days
-                FROM budget_entries
+                FROM effective_entries
                 WHERE {where}
                 """,
                 params,
@@ -993,8 +1072,8 @@ class Storage(DbConnection):
             excluded_total = 0.0
             if filter_sql:
                 all_total = connection.execute(
-                    f"SELECT COALESCE(SUM(amount), 0) AS total FROM budget_entries WHERE {' AND '.join(clauses)}",
-                    params[:-len(filter_params)] if filter_params else params,
+                    f"SELECT COALESCE(SUM(personal_amount), 0) AS total FROM effective_entries WHERE {' AND '.join(clauses)}",
+                    params[: -len(filter_params)] if filter_params else params,
                 ).fetchone()
                 excluded_total = float_value(all_total["total"]) - float_value(total_row["total"])
             period_days = (end_date - start_date).days + 1
@@ -1010,16 +1089,16 @@ class Storage(DbConnection):
             previous_params.extend(filter_params)
             previous_total_row = connection.execute(
                 f"""
-                SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
-                FROM budget_entries
+                SELECT COALESCE(SUM(personal_amount), 0) AS total, COUNT(*) AS count
+                FROM effective_entries
                 WHERE {where}
                 """,
                 previous_params,
             ).fetchone()
             categories = connection.execute(
                 f"""
-                SELECT category, COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
-                FROM budget_entries
+                SELECT category, COALESCE(SUM(personal_amount), 0) AS total, COUNT(*) AS count
+                FROM effective_entries
                 WHERE {where}
                 GROUP BY category
                 ORDER BY total DESC, category
@@ -1029,8 +1108,8 @@ class Storage(DbConnection):
             ).fetchall()
             subcategories = connection.execute(
                 f"""
-                SELECT subcategory, COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
-                FROM budget_entries
+                SELECT subcategory, COALESCE(SUM(personal_amount), 0) AS total, COUNT(*) AS count
+                FROM effective_entries
                 WHERE {where}
                 GROUP BY subcategory
                 ORDER BY total DESC, subcategory
@@ -1045,10 +1124,12 @@ class Storage(DbConnection):
         if previous_total > 0:
             previous_delta_percent = previous_delta / previous_total * 100
         return {
+            "colors": self.category_colors(),
             "start_date": start_date,
             "end_date": end_date,
             "category": category,
             "total": total,
+            "adjustment": float_value(total_row["adjustment"]),
             "count": int(total_row["count"] or 0),
             "period_days": period_days,
             "active_days": int(total_row["active_days"] or 0),
@@ -1086,8 +1167,8 @@ class Storage(DbConnection):
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT operation_date, COALESCE(SUM(amount), 0) AS total
-                FROM budget_entries
+                SELECT operation_date, COALESCE(SUM(personal_amount), 0) AS total
+                FROM effective_entries
                 WHERE {where}
                 GROUP BY operation_date
                 ORDER BY operation_date
@@ -1216,8 +1297,8 @@ class Storage(DbConnection):
                 SELECT id, owner_id, source, operation_hash,
                        export_sheet AS workbook_sheet, export_row AS workbook_row,
                        operation_date, operation_type, amount, category, subcategory,
-                       name, note, bank, created_at, updated_at
-                FROM budget_entries
+                       name, note, bank, author_id, expense_entry_id, paid_amount, returned_amount, personal_amount, created_at, updated_at
+                FROM effective_entries
                 WHERE owner_id = %s AND operation_date >= %s AND operation_date <= %s
                 ORDER BY operation_date, id
                 """,
@@ -1232,8 +1313,8 @@ class Storage(DbConnection):
                 SELECT id, owner_id, source, operation_hash,
                        export_sheet AS workbook_sheet, export_row AS workbook_row,
                        operation_date, operation_type, amount, category, subcategory,
-                       name, note, bank, is_mandatory, created_at, updated_at
-                FROM budget_entries
+                       name, note, bank, author_id, expense_entry_id, paid_amount, returned_amount, personal_amount, is_mandatory, created_at, updated_at
+                FROM effective_entries
                 WHERE owner_id = %s AND id = %s
                 """,
                 (self.owner_id, entry_id),
@@ -1241,22 +1322,34 @@ class Storage(DbConnection):
             return entry_row(row) if row is not None else None
 
     def update_budget_entry(self, entry_id: int, operation: ParsedOperation) -> None:
+        from ..planning import amount_decimal
+
+        value = amount_decimal(abs(operation.amount))
         with self._connect() as connection:
+            self._lock_budget(connection)
+            entry = connection.execute(
+                "SELECT * FROM effective_entries WHERE owner_id=%s AND id=%s", (self.owner_id, entry_id)
+            ).fetchone()
+            self._require_edit(connection, entry)
+            if entry["operation_type"] == "expense":
+                if value < entry["returned_amount"]:
+                    raise ValueError("Сумма покупки меньше уже возвращённой. Сначала переназначь возвраты.")
+                earliest = connection.execute(
+                    "SELECT MIN(operation_date) AS d FROM budget_entries WHERE owner_id=%s AND expense_entry_id=%s",
+                    (self.owner_id, entry_id),
+                ).fetchone()["d"]
+                if earliest and operation.date > earliest:
+                    raise ValueError("Дата покупки позже связанного возврата.")
+            elif entry["operation_type"] == "reimbursement":
+                self._validate_purchase(
+                    connection, {**entry, "amount": value, "operation_date": operation.date}, entry["expense_entry_id"]
+                )
             connection.execute(
-                """
-                UPDATE budget_entries
-                SET operation_date = %s,
-                    amount = %s,
-                    category = %s,
-                    subcategory = %s,
-                    name = %s,
-                    note = %s,
-                    updated_at = %s
-                WHERE owner_id = %s AND id = %s
-                """,
+                """UPDATE budget_entries SET operation_date=%s, amount=%s,category=%s,subcategory=%s,name=%s,note=%s,updated_at=%s
+                   WHERE owner_id=%s AND id=%s""",
                 (
                     operation.date,
-                    Decimal(f"{operation.excel_amount:.2f}"),
+                    value,
                     operation.category,
                     operation.subcategory,
                     operation.name,
@@ -1269,10 +1362,20 @@ class Storage(DbConnection):
 
     def delete_budget_entry(self, entry_id: int) -> None:
         with self._connect() as connection:
+            self._lock_budget(connection)
+            entry = connection.execute(
+                "SELECT * FROM budget_entries WHERE owner_id=%s AND id=%s", (self.owner_id, entry_id)
+            ).fetchone()
+            self._require_edit(connection, entry)
+            if connection.execute(
+                "SELECT 1 FROM budget_entries WHERE owner_id=%s AND expense_entry_id=%s", (self.owner_id, entry_id)
+            ).fetchone():
+                raise ValueError("У покупки есть возвраты. Сначала измени их назначение.")
             connection.execute(
-                "DELETE FROM budget_entries WHERE owner_id = %s AND id = %s",
+                "UPDATE recurring_instances SET entry_id=NULL,status='skipped' WHERE owner_id=%s AND entry_id=%s",
                 (self.owner_id, entry_id),
             )
+            connection.execute("DELETE FROM budget_entries WHERE owner_id=%s AND id=%s", (self.owner_id, entry_id))
 
     def shift_budget_entry_rows_after_delete(self, workbook_sheet: str, deleted_row: int) -> None:
         with self._connect() as connection:
@@ -1439,6 +1542,7 @@ class Storage(DbConnection):
         max_attempts: int = 3,
     ) -> int:
         self.ensure_owner()
+        payload = {**payload, "actor_id": self.actor_id}
         timestamp = now_iso()
         with self._connect() as connection:
             row = connection.execute(

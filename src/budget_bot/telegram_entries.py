@@ -10,7 +10,21 @@ from .telegram_common import button_rows, category_keyboard, format_money, opera
 from .telegram_reports import chart_period_payload
 
 
-ENTRY_ACTIONS = {"entrylist", "entryfind", "entry", "edel", "edelok", "eamt", "edate", "ename", "ecat", "esub", "eback", "emandatory"}
+ENTRY_ACTIONS = {
+    "entrylist",
+    "entryfind",
+    "entry",
+    "edel",
+    "edelok",
+    "eamt",
+    "edate",
+    "ename",
+    "ecat",
+    "esub",
+    "eback",
+    "emandatory",
+    "eincome",
+}
 ENTRY_LIST_PAGE_SIZE = 15
 ENTRY_SEARCH_RESULT_LIMIT = 10
 
@@ -67,6 +81,34 @@ class TelegramEntryEditor:
         if entry is None:
             self.bot._answer_callback(callback["id"], "Запись уже удалена")
             self.bot._delete_callback_message(callback)
+            return
+
+        if action == "eincome":
+            target = next(
+                (
+                    r
+                    for r in self.bot.context.storage.category_catalog()
+                    if r["id"] == parse_index(payload, 1) and r["kind"] == "income"
+                ),
+                None,
+            )
+            if not target or entry["operation_type"] != "income":
+                raise ValueError("Категория дохода не найдена.")
+            self.bot.context.storage.update_budget_entry(entry_id, entry_operation(entry, category=target["name"]))
+            self.bot._answer_callback(callback["id"], "Категория обновлена")
+            return
+        if action == "ecat" and entry["operation_type"] == "income":
+            choices = [r for r in self.bot.context.storage.category_catalog() if r["kind"] == "income"]
+            self.bot._send_message(
+                chat_id,
+                "Категория дохода:",
+                reply_markup={
+                    "inline_keyboard": [
+                        [{"text": r["name"], "callback_data": f"eincome:{entry_id}:{r['id']}"}] for r in choices
+                    ]
+                },
+            )
+            self.bot._answer_callback(callback["id"], "Выбери категорию")
             return
 
         if action == "entry":
@@ -313,7 +355,7 @@ class TelegramEntryEditor:
         entry_id = int(entry["id"])
         self.bot._send_message(
             chat_id,
-            entry_details_text(entry),
+            entry_details_text(entry) + self.refund_details(entry),
             reply_markup={
                 "inline_keyboard": [
                     [
@@ -322,20 +364,65 @@ class TelegramEntryEditor:
                     ],
                     [
                         {"text": "Описание", "callback_data": f"ename:{entry_id}"},
-                        {"text": "Категория", "callback_data": f"ecat:{entry_id}"},
+                        *(
+                            [{"text": "Категория", "callback_data": f"ecat:{entry_id}"}]
+                            if entry["operation_type"] in {"expense", "income"}
+                            else []
+                        ),
                     ],
-                    *([[{"text": "Обязательная ✓" if entry.get("is_mandatory") else "Отметить обязательной",
-                          "callback_data": f"emandatory:{entry_id}"}]] if entry["operation_type"] == "expense" else []),
+                    *(
+                        [
+                            [
+                                {
+                                    "text": "Обязательная ✓" if entry.get("is_mandatory") else "Отметить обязательной",
+                                    "callback_data": f"emandatory:{entry_id}",
+                                }
+                            ]
+                        ]
+                        if entry["operation_type"] == "expense"
+                        else []
+                    ),
+                    *(
+                        [[{"text": "Возвраты → Добавить возврат", "callback_data": f"refundadd:{entry_id}"}]]
+                        if entry["operation_type"] == "expense"
+                        else [[{"text": "Изменить назначение", "callback_data": f"purpose:{entry_id}"}]]
+                    ),
+                    *(
+                        [[{"text": "Открыть трату", "callback_data": f"entry:{entry['expense_entry_id']}"}]]
+                        if entry.get("expense_entry_id")
+                        else []
+                    ),
                     [{"text": "Удалить", "callback_data": f"edel:{entry_id}"}],
                 ]
             },
         )
 
+    def refund_details(self, entry):
+        if entry["operation_type"] == "expense":
+            refunds = self.bot.context.storage.reimbursements(entry["id"])
+            lines = [
+                f"Оплачено: {entry['amount']:.2f} ₽",
+                f"Возвращено: {entry.get('returned_amount',0):.2f} ₽",
+                f"Личный расход: {entry.get('personal_amount',entry['amount']):.2f} ₽",
+            ]
+            lines += [
+                f"Возврат #{r['id']} · {r['operation_date']} · {r['name']} · {r['amount']:.2f} ₽" for r in refunds
+            ]
+            return "\n" + "\n".join(lines)
+        if entry.get("expense_entry_id"):
+            return f"\nСвязанная покупка: #{entry['expense_entry_id']}"
+        return ""
+
     def send_entry_delete_confirmation(self, chat_id: int, entry: Dict[str, Any]) -> None:
         entry_id = int(entry["id"])
         self.bot._send_message(
             chat_id,
-            f"Удалить запись?\n{entry_summary_text(entry)}",
+            f"Удалить запись?\n{entry_summary_text(entry)}"
+            + (
+                f"\nЛичный расход покупки увеличится на {entry['amount']:.2f} ₽. Импорт останется отмеченным."
+                if entry["operation_type"] == "reimbursement"
+                else ""
+            ),
             reply_markup={
                 "inline_keyboard": [
                     [
@@ -540,7 +627,9 @@ def entry_category_summary(entry: Dict[str, Any]) -> str:
         return f"{category} / {subcategory}"
     if category:
         return category
-    return str(entry.get("operation_type") or "операция")
+    return {"reimbursement": "возмещение", "transfer": "перевод между своими"}.get(
+        entry.get("operation_type"), str(entry.get("operation_type") or "операция")
+    )
 
 
 def entry_operation(

@@ -9,6 +9,19 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+import colorsys
+import hashlib
+
+
+def category_color(summary, label):
+    label = next((name for name in summary.get("colors", {}) if _truncate_label(name) == label), label)
+    base = summary.get("colors", {}).get(summary.get("category") or label, "#8795a8")
+    if not summary.get("category"):
+        return base
+    rgb = tuple(int(base[index : index + 2], 16) / 255 for index in (1, 3, 5))
+    hue, lightness, saturation = colorsys.rgb_to_hls(*rgb)
+    variant = int(hashlib.sha256(label.encode()).hexdigest()[:4], 16) / 65535
+    return colorsys.hls_to_rgb(hue, 0.3 + variant * 0.45, max(0.35, saturation))
 
 
 def render_expense_chart(
@@ -45,6 +58,7 @@ def render_expense_chart(
     if pie_values:
         pie_axis.pie(
             pie_values,
+            colors=[category_color(summary, label) for label in pie_labels],
             labels=pie_labels,
             autopct=lambda value: f"{value:.0f}%" if value >= 5 else "",
             startangle=90,

@@ -122,6 +122,12 @@ def test_statement_normalized_duplicate_does_not_ignore_different_date_amount_or
 
 
 class FakeStorage:
+
+    def atomic(self):
+        from contextlib import nullcontext
+
+        return nullcontext()
+
     def __init__(self, existing_entries: Optional[List[Dict[str, object]]] = None) -> None:
         self.existing_entries = existing_entries or []
         self.budget_entries: List[BudgetEntryInsert] = []

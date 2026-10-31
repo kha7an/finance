@@ -10,6 +10,10 @@ from budget_bot.telegram_bot import TelegramBot, _written_operation_summary_line
 
 
 class FakeStatsStorage:
+
+    def analytics_settings(self):
+        return {"limits": {}}
+
     def __init__(self) -> None:
         self.report_periods: List[tuple[date, date, Optional[str]]] = []
 
@@ -34,6 +38,7 @@ class FakeStatsStorage:
 class FakeStatsContext:
     def __init__(self, storage: FakeStatsStorage) -> None:
         self.storage = storage
+        self.settings = SimpleNamespace(default_timezone="Europe/Moscow")
 
 
 def _stats_bot(storage: FakeStatsStorage) -> TelegramBot:

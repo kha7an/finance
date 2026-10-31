@@ -16,6 +16,9 @@ class FakeConnection:
         self.calls.append((query, params))
         return self
 
+    def fetchone(self):
+        return None
+
     def fetchall(self) -> list[Any]:
         return []
 
@@ -48,14 +51,14 @@ def test_replace_budget_entries_uses_batch_insert() -> None:
 
     assert storage.replace_budget_entries(rows) == 2
 
-    assert len(connection.calls) == 2
-    delete_query, delete_params = connection.calls[0]
-    insert_query, insert_params = connection.calls[1]
+    assert len(connection.calls) == 5
+    delete_query, delete_params = connection.calls[3]
+    insert_query, insert_params = connection.calls[4]
     assert "DELETE FROM budget_entries" in delete_query
     assert delete_params == (DEFAULT_OWNER_ID,)
     assert "INSERT INTO budget_entries" in insert_query
     assert insert_query.count("(%s, %s") == 2
-    assert len(insert_params) == 30
+    assert len(insert_params) == 32
 
 
 def test_budget_entries_keeps_insert_order_inside_day() -> None:

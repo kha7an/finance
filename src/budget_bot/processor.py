@@ -44,6 +44,10 @@ class ScreenshotProcessor:
         parsed: ParsedScreenshot,
         telegram_file_id: Optional[str] = None,
     ) -> ProcessingResult:
+        with self.storage.atomic():
+            return self._process(image_content, parsed, telegram_file_id)
+
+    def _process(self, image_content, parsed, telegram_file_id) -> ProcessingResult:
         image_hash = make_image_hash(image_content)
         if self.storage.image_seen(image_hash):
             return ProcessingResult(image_hash=image_hash, bank=parsed.bank, decisions=[])
@@ -211,7 +215,7 @@ class ScreenshotProcessor:
                 return OperationStatus.PENDING, "income amount must be positive"
             return OperationStatus.PENDING, "income manual decision required"
 
-        if operation.type in {OperationType.TRANSFER, OperationType.IGNORE}:
+        if operation.type in {OperationType.TRANSFER, OperationType.IGNORE, OperationType.REIMBURSEMENT}:
             return OperationStatus.PENDING, "manual decision required"
 
         if operation.needs_review:
@@ -312,11 +316,14 @@ def _matches_existing_entry(bank: str, operation: ParsedOperation, entries: List
     operation_cents = _amount_cents(operation.amount)
     for entry in entries:
         entry_bank = str(entry.get("bank") or "").strip().lower()
-        if entry_bank and normalized_bank and entry_bank != normalized_bank:
+        if entry_bank and normalized_bank and entry_bank != normalized_bank and not entry_bank.startswith("manual"):
             continue
         if str(entry.get("operation_date")) != operation.date.isoformat():
             continue
-        if str(entry.get("operation_type")) != operation.type.value:
+        entry_type = str(entry.get("operation_type"))
+        if entry_type != operation.type.value and not (
+            entry_type in {"income", "reimbursement", "transfer"} and operation.amount > 0
+        ):
             continue
         if _amount_cents(entry.get("amount")) != operation_cents:
             continue

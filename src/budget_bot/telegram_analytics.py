@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
+from .planning import financial_period
 from .analytics import analytics_lines, comparison_lines, limit_status, money, period_metrics, previous_period, shift_month
 from .telegram_common import button_rows
 from .telegram_reports import parse_chart_period_payload, chart_period_payload
@@ -33,18 +34,29 @@ class TelegramAnalytics:
         filter_payload = f"analysis:filter:{tab}"
         if start is not None and end is not None:
             filter_payload = f"cf:{chart_period_payload(start, end, category)}"
-        return {"inline_keyboard": [
-            [{"text": "Расходы", "callback_data": "stats:month"},
-             {"text": "Сравнение", "callback_data": "analysis:compare"}],
-            [{"text": "Доходы и остаток", "callback_data": "analysis:balance"},
-             {"text": "Динамика", "callback_data": "analysis:trends"}],
-            [{"text": "Лимиты", "callback_data": "analysis:limits"},
-             {"text": "Прогноз", "callback_data": "analysis:forecast"}],
-            [{"text": mode, "callback_data": filter_payload},
-             {"text": "Настройки", "callback_data": "analysis:settings"}],
-            [{"text": "Диаграмма за месяц", "callback_data": "chart:month"}],
-            [{"text": "Даты и категории", "callback_data": "analytics:menu"}],
-        ]}
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "Расходы", "callback_data": "stats:month"},
+                    {"text": "Сравнение", "callback_data": "analysis:compare"},
+                ],
+                [
+                    {"text": "Доходы и остаток", "callback_data": "analysis:balance"},
+                    {"text": "Динамика", "callback_data": "analysis:trends"},
+                ],
+                [
+                    {"text": "Лимиты", "callback_data": "analysis:limits"},
+                    {"text": "Прогноз", "callback_data": "analysis:forecast"},
+                ],
+                [
+                    {"text": mode, "callback_data": filter_payload},
+                    {"text": "Настройки", "callback_data": "analysis:settings"},
+                ],
+                [{"text": "Диаграмма за месяц", "callback_data": "chart:month"}],
+                [{"text": "Планирование", "callback_data": "plan:home"}],
+                [{"text": "Даты и категории", "callback_data": "analytics:menu"}],
+            ]
+        }
 
     def send_tab(self, chat_id: int, tab: str, start: Optional[date] = None, end: Optional[date] = None, category: Optional[str] = None) -> None:
         today = self.today()
@@ -60,6 +72,11 @@ class TelegramAnalytics:
         else:
             rows = self.storage.analytics_rows(shift_month(today.replace(day=1), -5), today)
             lines = analytics_lines(tab, rows, settings, today)
+            if tab == "forecast":
+                plan = self.storage.planning_summary(today)
+                lines.append(
+                    f"Известные предстоящие обязательства: {money(plan['reserve'])}. Показаны отдельно от оценки по темпу расходов."
+                )
         self.bot._send_message(chat_id, "\n".join(lines), reply_markup=self.navigation(tab, start, end, category))
 
     def send_settings(self, chat_id: int) -> None:
@@ -230,13 +247,17 @@ class TelegramAnalytics:
                 if not self.storage.analytics_notification_sent("weekly", week_start, "digest"):
                     rows = self.storage.analytics_rows(week_start - timedelta(days=7), week_end)
                     lines = ["Недельная сводка", *comparison_lines(rows, settings, week_start, week_end)]
-                    monthly_rows = self.storage.analytics_rows(today.replace(day=1), today)
-                    metrics = period_metrics(monthly_rows, settings, today.replace(day=1), today)
+                    monthly_rows = self.storage.analytics_rows(
+                        financial_period(today, settings.get("period_day", 1))[0], today
+                    )
+                    metrics = period_metrics(
+                        monthly_rows, settings, financial_period(today, settings.get("period_day", 1))[0], today
+                    )
                     for item in limit_status(metrics, settings):
                         lines.append(f"Лимит {item['category'] or 'Общий'}: {item['percent']:.0f}%, осталось {money(item['remaining'])}")
                     self._deliver(chat_id, "\n".join(lines), "weekly", week_start, "digest", self.navigation())
             if settings["limits"]:
-                start = today.replace(day=1)
+                start = financial_period(today, settings.get("period_day", 1))[0]
                 rows = self.storage.analytics_rows(start, today)
                 metrics = period_metrics(rows, settings, start, today)
                 for item in limit_status(metrics, settings):

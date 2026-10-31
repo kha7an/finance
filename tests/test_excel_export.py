@@ -14,7 +14,7 @@ def test_export_defaults_to_all_dates_and_preserves_explicit_period(
 ) -> None:
     context = SimpleNamespace(
         storage=object(),
-        settings=SimpleNamespace(export_dir=tmp_path),
+        settings=SimpleNamespace(export_dir=tmp_path, default_timezone="Europe/Moscow"),
         owner_id="telegram:123",
     )
     exports = []

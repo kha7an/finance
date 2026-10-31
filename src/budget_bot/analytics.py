@@ -34,7 +34,10 @@ def is_mandatory(row: Dict[str, Any], settings: Dict[str, Any]) -> bool:
 
 
 def period_metrics(rows: List[Dict[str, Any]], settings: Dict[str, Any], start: date, end: date) -> Dict[str, Any]:
-    totals = {key: Decimal(0) for key in ("expenses", "all_expenses", "excluded", "income")}
+    totals = {
+        key: Decimal(0)
+        for key in ("expenses", "all_expenses", "excluded", "income", "paid", "reimbursements", "adjustment")
+    }
     categories: Dict[str, Decimal] = defaultdict(Decimal)
     count = 0
     for row in rows:
@@ -43,7 +46,11 @@ def period_metrics(rows: List[Dict[str, Any]], settings: Dict[str, Any], start: 
         amount = Decimal(str(row["total"]))
         if row["operation_type"] == "income":
             totals["income"] += amount
+        elif row["operation_type"] == "reimbursement":
+            totals["reimbursements"] += amount
         elif row["operation_type"] == "expense":
+            totals["paid"] += Decimal(str(row.get("paid", row["total"])))
+            totals["adjustment"] += Decimal(str(row.get("returned", 0)))
             totals["all_expenses"] += amount
             if settings["exclude_mandatory"] and is_mandatory(row, settings):
                 totals["excluded"] += amount
@@ -51,7 +58,12 @@ def period_metrics(rows: List[Dict[str, Any]], settings: Dict[str, Any], start: 
             totals["expenses"] += amount
             categories[row["category"] or "Без категории"] += amount
             count += int(row["count"])
-    return {**totals, "categories": dict(categories), "count": count}
+    return {
+        **totals,
+        "cash_flow": totals["income"] + totals["reimbursements"] - totals["paid"],
+        "categories": dict(categories),
+        "count": count,
+    }
 
 
 def money(value: Decimal) -> str:
@@ -86,6 +98,9 @@ def comparison_lines(rows: List[Dict[str, Any]], settings: Dict[str, Any], start
         lines.append("Нет записанных расходов.")
     if settings["exclude_mandatory"]:
         lines.append(f"Исключено обязательных: {money(current['excluded'])} · раньше: {money(previous['excluded'])}")
+    lines.append(
+        f"Возвраты учтены на момент формирования отчёта: {money(current['adjustment'])} · раньше: {money(previous['adjustment'])}"
+    )
     return lines
 
 
@@ -102,21 +117,29 @@ def limit_status(metrics: Dict[str, Any], settings: Dict[str, Any]) -> List[Dict
 
 
 def analytics_lines(tab: str, rows: List[Dict[str, Any]], settings: Dict[str, Any], today: date) -> List[str]:
-    start = today.replace(day=1)
+    from .planning import financial_period
+
+    start, period_end = financial_period(today, settings.get("period_day", 1))
     metrics = period_metrics(rows, settings, start, today)
     if tab == "compare":
         return comparison_lines(rows, settings, start, today)
     if tab == "balance":
-        balance = metrics["income"] - metrics["all_expenses"]
-        lines = [f"Доходы и остаток · {start:%d.%m}–{today:%d.%m.%Y}",
-                 f"Доходы: {money(metrics['income'])}", f"Все расходы: {money(metrics['all_expenses'])}",
-                 f"Остаток за период: {money(balance)}"]
+        balance = metrics["cash_flow"]
+        lines = [
+            f"Доходы и движение денег · {start:%d.%m}–{today:%d.%m.%Y}",
+            f"Доходы: {money(metrics['income'])}",
+            f"Исходные оплаты: {money(metrics['paid'])}",
+            f"Полученные возмещения: {money(metrics['reimbursements'])}",
+            f"Личные расходы: {money(metrics['all_expenses'])}",
+            f"Движение денег: {money(balance)}",
+            f"Возвраты учтены на момент формирования отчёта: {money(metrics['adjustment'])}",
+        ]
         if metrics["income"]:
             lines.append(f"Доля оставшихся доходов: {balance / metrics['income']:.0%}")
         lines.append("По записанным операциям, не баланс банковского счёта. Обязательные расходы здесь учитываются.")
         return lines
     if tab == "limits":
-        lines = [f"Лимиты · {start:%m.%Y}"]
+        lines = [f"Лимиты периода · {start:%d.%m.%Y}–{period_end:%d.%m.%Y}"]
         for item in limit_status(metrics, settings):
             label = item["category"] or "Общий"
             left = f"Осталось {money(item['remaining'])}" if item["remaining"] >= 0 else f"Превышение {money(-item['remaining'])}"
@@ -129,29 +152,38 @@ def analytics_lines(tab: str, rows: List[Dict[str, Any]], settings: Dict[str, An
         lines = ["Динамика за 6 месяцев · расходы / доходы"]
         for offset in range(-5, 1):
             month = shift_month(start, offset)
-            end = today if offset == 0 else month.replace(day=monthrange(month.year, month.month)[1])
+            month, full_end = financial_period(month, settings.get("period_day", 1))
+            end = today if offset == 0 else full_end
             item = period_metrics(rows, settings, month, end)
             suffix = f" (по {today:%d.%m})" if offset == 0 else ""
-            lines.append(f"• {month:%m.%Y}: {money(item['expenses'])} / {money(item['income'])}{suffix}")
+            lines.append(
+                f"• {month:%d.%m.%Y}–{end:%d.%m.%Y}: {money(item['expenses'])} / {money(item['income'])}{suffix}"
+            )
         lines.append("Месяц без операций может означать, что данные не загружены.")
     elif tab == "forecast":
-        # shortcut: linear pace cannot predict future fixed payments; upgrade when planned payments exist.
-        days = monthrange(today.year, today.month)[1]
-        forecast = metrics["expenses"] / Decimal(today.day) * days
-        lines = [f"Оценка расходов на конец {today:%m.%Y}",
-                 f"Записано: {money(metrics['expenses'])}",
-                 f"Текущий темп: {money(metrics['expenses'] / Decimal(today.day))} в день",
-                 f"При таком темпе: ≈ {money(forecast)}",
-                 "Приблизительная оценка: крупные покупки и будущие фиксированные платежи могут изменить результат."]
+        # Planned obligations are shown separately; adding them to pace would count them twice.
+        days = (period_end - start).days + 1
+        elapsed = (today - start).days + 1
+        forecast = metrics["expenses"] / Decimal(elapsed) * days
+        lines = [
+            f"Оценка расходов до {period_end:%d.%m.%Y}",
+            f"Записано: {money(metrics['expenses'])}",
+            f"Текущий темп: {money(metrics['expenses'] / Decimal(elapsed))} в день",
+            f"При таком темпе: ≈ {money(forecast)}",
+            "Приблизительная оценка: крупные покупки и будущие фиксированные платежи могут изменить результат.",
+        ]
         if "" in settings["limits"]:
             limit = Decimal(settings["limits"][""])
             remaining = max(Decimal(0), limit - metrics["expenses"])
-            days_left = days - today.day
+            days_left = (period_end - today).days
             lines.append(f"Осталось в бюджете: {money(remaining)}")
             if days_left:
                 lines.append(f"На оставшиеся дни: {money(remaining / days_left)} в день")
     else:
         raise ValueError("Unknown analytics tab")
+    lines.append(
+        f"Возвраты учтены на момент формирования отчёта: {money(metrics['adjustment'])}; они могут менять оценку."
+    )
     if settings["exclude_mandatory"]:
         lines.append(f"Без обязательных расходов. Исключено за текущий месяц: {money(metrics['excluded'])}")
     else:

@@ -34,6 +34,9 @@ from .telegram_common import (
     parse_index as _parse_index,
     parse_user_operation_date as _parse_user_operation_date,
 )
+from .telegram_receipts import TelegramReceipts
+from .telegram_planning import TelegramPlanning
+from .planning import financial_period
 from .telegram_entries import ENTRY_ACTIONS, TelegramEntryEditor, expense_report_keyboard, is_entry_edit_pending, is_entry_search_pending
 from .telegram_manual import (
     MANUAL_ACTIONS,
@@ -119,6 +122,9 @@ class TelegramBot:
                     self.handle_update(update)
                 self._flush_ready_media_groups()
                 self._send_due_reminders()
+                if time.monotonic() - getattr(self, "_last_plan_check", 0) > 60:
+                    self._last_plan_check = time.monotonic()
+                    TelegramPlanning(self).due()
                 self._analytics().send_due_notifications()
                 time.sleep(0.5)
             except Exception as exc:
@@ -152,9 +158,20 @@ class TelegramBot:
         return self._api("getMe", {})["result"]
 
     def handle_update(self, update: Dict[str, Any]) -> None:
-        owner_id = telegram_owner_id(_telegram_user_id_from_update(update))
-        with self.context.owner_scope(owner_id):
-            self._handle_update_scoped(update)
+        user_id = _telegram_user_id_from_update(update)
+        if not self._is_allowed(user_id):
+            return
+        owner_id = telegram_owner_id(user_id)
+        with self.context.storage.user_scope(owner_id):
+            try:
+                with self.context.storage.telegram_update(update.get("update_id")) as fresh:
+                    if fresh:
+                        self._handle_update_scoped(update)
+            except ValueError as exc:
+                message = update.get("message") or update.get("callback_query", {}).get("message", {})
+                chat_id = message.get("chat", {}).get("id")
+                if chat_id is not None:
+                    self._send_message(chat_id, str(exc))
 
     def _handle_update_scoped(self, update: Dict[str, Any]) -> None:
         if "callback_query" in update:
@@ -171,6 +188,9 @@ class TelegramBot:
                 extra=log_extra(chat_id=chat_id, user_id=user_id, status="rejected"),
             )
             self._send_message(chat_id, "Этот бот принимает сообщения только от владельца.")
+            return
+        if self.context.owner_id.startswith("shared:") and chat_id != user_id:
+            self._send_message(chat_id, "Совместный бюджет доступен в личном чате с ботом. /budgets")
             return
         self.context.storage.register_telegram_chat(
             chat_id=chat_id,
@@ -215,7 +235,7 @@ class TelegramBot:
         photo = message["photo"][-1]
         file_id = photo["file_id"]
         try:
-            job_id = self.parse_jobs.enqueue_single(chat_id, file_id, date.today())
+            job_id = self.parse_jobs.enqueue_single(chat_id, file_id, self._analytics().today())
             logger.info(
                 "parse job queued",
                 extra=log_extra(
@@ -233,13 +253,14 @@ class TelegramBot:
     def _queue_media_group_photo(self, message: Dict[str, Any]) -> None:
         chat_id = message["chat"]["id"]
         media_group_id = str(message["media_group_id"])
-        group_key = f"{chat_id}:{media_group_id}"
+        group_key = f"{self.context.owner_id}:{self.context.storage.actor_id}:{chat_id}:{media_group_id}"
         group = self.media_groups.setdefault(
             group_key,
             {
                 "chat_id": chat_id,
                 "media_group_id": media_group_id,
                 "owner_id": self.context.owner_id,
+                "actor_id": self.context.storage.actor_id,
                 "messages": [],
                 "updated_at": time.monotonic(),
             },
@@ -266,8 +287,11 @@ class TelegramBot:
             group = self.media_groups.pop(key)
             owner_id = str(group.get("owner_id") or "")
             if owner_id:
-                with self.context.owner_scope(owner_id):
-                    self._handle_photo_group(group)
+                try:
+                    with self.context.storage.user_scope(group.get("actor_id") or owner_id, owner_id):
+                        self._handle_photo_group(group)
+                except ValueError:
+                    self._send_message(group["chat_id"], "Доступ к бюджету прекращён. Альбом не обработан.")
             else:
                 self._handle_photo_group(group)
 
@@ -277,7 +301,7 @@ class TelegramBot:
         messages = list(group["messages"])
         file_ids = [message["photo"][-1]["file_id"] for message in messages]
         try:
-            job_id = self.parse_jobs.enqueue_album(chat_id, file_ids, media_group_id, date.today())
+            job_id = self.parse_jobs.enqueue_album(chat_id, file_ids, media_group_id, self._analytics().today())
             logger.info(
                 "parse album job queued",
                 extra=log_extra(
@@ -309,6 +333,50 @@ class TelegramBot:
             self._answer_callback(callback["id"], "Не понял действие")
             return
 
+        if action == "receipts":
+            TelegramReceipts(self).listing(chat_id, int(payload))
+            self._answer_callback(callback["id"], "Поступления")
+            return
+        if action == "receipt":
+            TelegramReceipts(self).callback(callback, chat_id, payload)
+            return
+        if action in {"refund", "receiptincome", "receipttransfer", "purpose", "refundadd"}:
+            TelegramReceipts(self).start(
+                chat_id,
+                source_hash=payload if action in {"refund", "receiptincome", "receipttransfer"} else None,
+                entry_id=int(payload) if action == "purpose" else None,
+                purchase_id=int(payload) if action == "refundadd" else None,
+                initial_purpose={
+                    "refund": "reimbursement",
+                    "receiptincome": "income",
+                    "receipttransfer": "transfer",
+                }.get(action),
+            )
+            self._answer_callback(callback["id"], "Выбор назначения")
+            return
+        if action == "plan":
+            TelegramPlanning(self).callback(callback, chat_id, payload)
+            return
+        if action == 'pay':
+            instance_id,operation=payload.split(':')
+            if operation not in {'record','amount','skip'}:
+                raise ValueError('Неизвестное действие с платежом.')
+            budget=self.context.storage.recurring_access_budget(int(instance_id))
+            self.context.storage.select_budget(budget)
+            with self.context.storage.user_scope(self.context.storage.actor_id,budget):
+                TelegramPlanning(self).callback(callback,chat_id,f'{operation}:{instance_id}')
+            return
+        if action == "planbudget":
+            self.context.storage.select_budget(payload)
+            with self.context.storage.user_scope(self.context.storage.actor_id, payload):
+                TelegramPlanning(self).payments(chat_id)
+            self._answer_callback(callback["id"], "Бюджет платежей выбран")
+            return
+        if action == "budget":
+            self.context.storage.select_budget(payload)
+            self._answer_callback(callback["id"], "Бюджет выбран")
+            self._send_message(chat_id, "Бюджет выбран. /budgets")
+            return
         if action == "catalog":
             TelegramCategories(self).handle_callback(callback, chat_id, payload)
             return
@@ -356,6 +424,9 @@ class TelegramBot:
             return
 
         row = self.context.storage.get_operation(operation_hash)
+        if row is not None:
+            with self.context.storage._connect() as connection:
+                self.context.storage._require_edit(connection, row)
         if not _can_decide_operation(row):
             self.context.storage.delete_pending_action(operation_hash)
             self._answer_callback(callback["id"], "Операция уже закрыта")
@@ -517,7 +588,7 @@ class TelegramBot:
         if text.startswith("/sheet"):
             self._handle_sheet_command(chat_id, text)
             return
-        if text.startswith("/budget"):
+        if text == "/budget":
             self._send_message(chat_id, self.context.budget_account_summary(), reply_markup=self._main_reply_keyboard())
             return
         if text.startswith("/reminders"):
@@ -533,7 +604,9 @@ class TelegramBot:
             self._send_message(chat_id, "Главное меню:", reply_markup=self._main_reply_keyboard())
             return
 
-        today = date.today()
+        if TelegramPlanning(self).command(chat_id, text):
+            return
+        today = self._analytics().today()
         message_id = message.get("message_id")
         if text in {"Расход", "+ Расход", "Добавить расход"}:
             self._start_manual_entry(chat_id, OperationType.EXPENSE, message_id=message_id)
@@ -542,6 +615,10 @@ class TelegramBot:
             self._start_manual_entry(chat_id, OperationType.INCOME, message_id=message_id)
             return
         pending = self.context.storage.latest_pending_for_chat(chat_id)
+        if pending is not None and TelegramReceipts(self).text(chat_id, text, pending):
+            return
+        if pending is not None and TelegramPlanning(self).text(chat_id, text, pending):
+            return
         if pending is not None and is_manual_pending(pending):
             self._handle_manual_text(chat_id, text, pending, message_id=message_id)
             return
@@ -564,7 +641,12 @@ class TelegramBot:
         if pending is None:
             manual_operation = _parse_manual_operation_text(text, today.year, self.context.category_book)
             if manual_operation is not None:
-                self._write_manual_operation(chat_id, manual_operation)
+                if manual_operation.type == OperationType.INCOME:
+                    TelegramReceipts(self).start(chat_id, manual_operation)
+                else:
+                    self._write_manual_operation(chat_id, manual_operation)
+                return
+            if self._manual_entry().short(chat_id, text, message_id):
                 return
             period = _parse_stats_period(text, today.year)
             if period is not None:
@@ -577,6 +659,8 @@ class TelegramBot:
         operation_hash = pending["operation_hash"]
         row = self.context.storage.get_operation(operation_hash)
         if row is not None:
+            with self.context.storage._connect() as connection:
+                self.context.storage._require_edit(connection, row)
             pending_operation = operation_from_json(row["operation_json"])
             if pending_operation.date_missing:
                 self._handle_missing_date_text(chat_id, text, row, operation_hash)
@@ -912,8 +996,9 @@ class TelegramBot:
             self._send_message(chat_id, "Сброс отменен.")
             return
         if action == "reset_confirm":
+            saved_hashes = self.context.storage.source_image_hashes()
             self.context.storage.reset_all()
-            self._clear_saved_images()
+            self._clear_saved_images(saved_hashes)
             self._answer_callback(callback["id"], "Сброшено")
             self._delete_callback_message(callback)
             self._send_message(chat_id, "Готово: расходы, доходы, история и сохраненные копии скринов очищены.")
@@ -931,7 +1016,7 @@ class TelegramBot:
         if action == "analytics":
             self._send_analytics_menu(chat_id)
             return
-        today = date.today()
+        today = self._analytics().today()
         if action == "stats":
             if payload == "today":
                 self._send_expense_report(chat_id, today, today)
@@ -945,7 +1030,11 @@ class TelegramBot:
             if payload == "period":
                 self._send_stats_period_picker(chat_id)
                 return
-            self._send_expense_report(chat_id, today.replace(day=1), today)
+            self._send_expense_report(
+                chat_id,
+                financial_period(today, self.context.storage.analytics_settings().get("period_day", 1))[0],
+                today,
+            )
             return
         if action == "statsmonth":
             month_start = _parse_stats_month_payload(payload)
@@ -968,7 +1057,12 @@ class TelegramBot:
                 self._send_message(chat_id, "Категория устарела. Открой список заново.", reply_markup=self._main_reply_keyboard())
                 return
             category, _subcategories = category_item
-            self._send_expense_report(chat_id, today.replace(day=1), today, category=category)
+            self._send_expense_report(
+                chat_id,
+                financial_period(today, self.context.storage.analytics_settings().get("period_day", 1))[0],
+                today,
+                category=category,
+            )
             return
         if action == "chart":
             if payload == "today":
@@ -978,7 +1072,11 @@ class TelegramBot:
                 self._send_expense_chart(chat_id, today - timedelta(days=today.weekday()), today)
                 return
             if payload in {"month", ""}:
-                self._send_expense_chart(chat_id, today.replace(day=1), today)
+                self._send_expense_chart(
+                    chat_id,
+                    financial_period(today, self.context.storage.analytics_settings().get("period_day", 1))[0],
+                    today,
+                )
                 return
             if payload == "period":
                 self._send_message(
@@ -997,9 +1095,13 @@ class TelegramBot:
 
     def _handle_stats_text(self, chat_id: int, text: str) -> None:
         parts = text.split(maxsplit=1)
-        today = date.today()
+        today = self._analytics().today()
         if len(parts) == 1:
-            self._send_expense_report(chat_id, today.replace(day=1), today)
+            self._send_expense_report(
+                chat_id,
+                financial_period(today, self.context.storage.analytics_settings().get("period_day", 1))[0],
+                today,
+            )
             return
         period = _parse_stats_period(parts[1], today.year)
         if period is None:
@@ -1013,7 +1115,7 @@ class TelegramBot:
 
     def _handle_export_text(self, chat_id: int, text: str) -> None:
         parts = text.split(maxsplit=1)
-        today = date.today()
+        today = self._analytics().today()
         if len(parts) > 1:
             period = _parse_stats_period(parts[1], today.year)
             if period is None:
@@ -1324,21 +1426,20 @@ class TelegramBot:
     def _main_reply_keyboard(self) -> Dict[str, Any]:
         return {
             "keyboard": [
-                [{"text": "Расход"}, {"text": "Доход"}],
-                [{"text": "Категории"}],
+                [{"text": "Расход"}, {"text": "Доход"}, {"text": "Поступления"}],
+                [{"text": "Категории"}, {"text": "Планирование"}, {"text": "Бюджеты"}],
                 [{"text": "Аналитика"}, {"text": "Синхронизировать"}, {"text": "Сброс"}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
         }
 
-    def _clear_saved_images(self) -> None:
+    def _clear_saved_images(self, hashes) -> None:
         image_dir = self.context.settings.export_dir.parent / "images"
-        if not image_dir.exists():
-            return
-        for path in image_dir.iterdir():
-            if path.is_file():
-                path.unlink()
+        for value in hashes:
+            for path in image_dir.glob(f"{value}.*"):
+                if path.is_file():
+                    path.unlink()
 
     def _delete_callback_message(self, callback: Dict[str, Any]) -> None:
         message = callback.get("message") or {}
@@ -1463,6 +1564,15 @@ class TelegramBot:
         operation_hash: str,
         operation: Optional[ParsedOperation] = None,
     ) -> Dict[str, Any]:
+        if operation is not None and operation.amount > 0:
+            return {
+                "inline_keyboard": [
+                    [{"text": "Считать доходом", "callback_data": f"receiptincome:{operation_hash}"}],
+                    [{"text": "Отнять от траты", "callback_data": f"refund:{operation_hash}"}],
+                    [{"text": "Перевод между своими", "callback_data": f"receipttransfer:{operation_hash}"}],
+                    [{"text": "Пропустить", "callback_data": f"skip:{operation_hash}"}],
+                ]
+            }
         if operation is not None and operation.type == OperationType.INCOME:
             return {
                 "inline_keyboard": [
@@ -1532,6 +1642,29 @@ class TelegramBot:
             return None
         return category, subcategories[subcategory_index]
 
+    def _written_limits_lines(self, operations):
+        from .analytics import period_metrics, limit_status, money
+
+        settings = self.context.storage.analytics_settings()
+        if not settings["limits"]:
+            return []
+        lines = []
+        seen = set()
+        for operation in operations:
+            if operation.type != OperationType.EXPENSE:
+                continue
+            start, end = financial_period(operation.date, settings.get("period_day", 1))
+            category = operation.category if operation.category in settings["limits"] else ""
+            if category not in settings["limits"] or (start, category) in seen:
+                continue
+            seen.add((start, category))
+            metrics = period_metrics(self.context.storage.analytics_rows(start, end), settings, start, end)
+            item = next(item for item in limit_status(metrics, settings) if item["category"] == category)
+            lines.append(
+                f"Остаток лимита {category or 'общий'} ({start:%d.%m}–{end:%d.%m}): {money(item['remaining'])}"
+            )
+        return lines
+
     def _send_processing_result(self, chat_id: int, result) -> None:
         if not result.decisions:
             self._send_message(chat_id, "Этот файл уже обработан, дубли не добавляю.")
@@ -1548,7 +1681,7 @@ class TelegramBot:
             written_operations = [decision.operation for decision in written]
             message_id = self._send_message(
                 chat_id,
-                "\n".join(_written_summary_lines(written)),
+                "\n".join(_written_summary_lines(written) + self._written_limits_lines(written_operations)),
                 reply_markup=_written_operations_keyboard(written_operations),
             )
             if pending and message_id is not None:
@@ -1607,15 +1740,32 @@ class TelegramBot:
             preview_chat_id, preview_message_id = preview
             self._delete_message(preview_chat_id, preview_message_id)
 
-        written_operations = [
-            operation_from_json(row["operation_json"])
-            for row in rows
-            if row["status"] == OperationStatus.AUTO_WRITTEN.value
-        ]
+        written_operations = []
+        for row in rows:
+            if row["status"] != OperationStatus.AUTO_WRITTEN.value:
+                continue
+            entry = self.context.storage.get_budget_entry(row["workbook_row"]) if row.get("workbook_row") else None
+            if entry:
+                kind = OperationType(entry["operation_type"])
+                written_operations.append(
+                    ParsedOperation(
+                        date.fromisoformat(entry["operation_date"]),
+                        entry["name"],
+                        -abs(entry["amount"]) if kind == OperationType.EXPENSE else abs(entry["amount"]),
+                        kind,
+                        entry["category"],
+                        entry["subcategory"],
+                    )
+                )
+            else:
+                written_operations.append(operation_from_json(row["operation_json"]))
         if written_operations:
             self._send_message(
                 chat_id,
-                "\n".join(_written_operation_summary_lines(written_operations)),
+                "\n".join(
+                    _written_operation_summary_lines(written_operations)
+                    + self._written_limits_lines(written_operations)
+                ),
                 reply_markup=_written_operations_keyboard(written_operations),
             )
         else:

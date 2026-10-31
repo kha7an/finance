@@ -46,6 +46,10 @@ class TelegramCategories:
         if category["kind"] == "expense" and subcategory is None:
             rows = button_rows([{"text": row["name"], "callback_data": f"catalog:show:{category_id}:{row['id']}"} for row in category["subcategories"]], columns=2)
             rows.append([{"text": "Добавить подкатегорию", "callback_data": f"catalog:addsub:{category_id}"}])
+        if subcategory:
+            rows.append([{"text": "Перенести в другую категорию", "callback_data": f"catalog:move:{subcategory_id}"}])
+        else:
+            rows.append([{"text": "Изменить цвет", "callback_data": f"catalog:color:{category_id}"}])
         rows.append([{"text": "Переименовать", "callback_data": f"catalog:rename:{target}"}, {"text": "Удалить", "callback_data": f"catalog:delete:{target}"}])
         back = f"catalog:show:{category_id}" if subcategory else f"catalog:list:{category['kind']}"
         rows.append([{"text": "Назад", "callback_data": back}])
@@ -64,6 +68,52 @@ class TelegramCategories:
         action = parts[0]
         self.bot._answer_callback(callback["id"], "Категории")
         try:
+            if action == "color":
+                self._item(int(parts[1]))
+                self._prompt(
+                    chat_id, {"action": "color", "category_id": int(parts[1])}, "Новый цвет в формате #4c78a8:"
+                )
+                return
+            if action == "move":
+                source = int(parts[1])
+                rows = [
+                    r
+                    for r in self.bot.context.storage.category_catalog()
+                    if r["kind"] == "expense" and all(sub["id"] != source for sub in r["subcategories"])
+                ]
+                self.bot._send_message(
+                    chat_id,
+                    "Куда перенести подкатегорию?",
+                    reply_markup={
+                        "inline_keyboard": [
+                            [{"text": r["name"], "callback_data": f"catalog:movepreview:{source}:{r['id']}"}]
+                            for r in rows
+                        ]
+                    },
+                )
+                return
+            if action in {"movepreview", "moveconfirm"}:
+                source, target = map(int, parts[1:])
+                count = self.bot.context.storage.move_subcategory(source, target, action == "moveconfirm")
+                if action == "movepreview":
+                    self.bot._send_message(
+                        chat_id,
+                        f"Перенести подкатегорию? Затронуто записей: {count}. Обновятся история, правила и регулярные шаблоны. Лимиты категорий останутся привязаны к своим категориям.",
+                        reply_markup={
+                            "inline_keyboard": [
+                                [
+                                    {
+                                        "text": "Подтвердить перенос",
+                                        "callback_data": f"catalog:moveconfirm:{source}:{target}",
+                                    },
+                                    {"text": "Отмена", "callback_data": "catalog:cancel"},
+                                ]
+                            ]
+                        },
+                    )
+                else:
+                    self.bot._send_message(chat_id, f"Перенесено. Обновлено записей: {count}.")
+                return
             if action in {"close", "cancel"}:
                 self._clear(chat_id)
                 self.bot._delete_callback_message(callback)
@@ -126,7 +176,11 @@ class TelegramCategories:
             return True
         try:
             storage = self.bot.context.storage
-            if action == "add":
+            if action == "color":
+                storage.set_category_color(state["category_id"], text)
+                self._clear(chat_id)
+                self.show(chat_id, state["category_id"])
+            elif action == "add":
                 category_id = storage.create_category(state["kind"], text)
                 self._clear(chat_id)
                 self.show(chat_id, category_id)

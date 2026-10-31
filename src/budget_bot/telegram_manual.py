@@ -3,20 +3,91 @@ from __future__ import annotations
 import json
 import re
 import time
+import secrets
 from datetime import date
 from typing import Any, Dict, Optional
 
 from .models import OperationStatus, OperationType, ParsedOperation
 from .storage import operation_hash as make_operation_hash
 from .telegram_common import button_rows, category_keyboard, parse_index, parse_money_amount, parse_user_operation_date
+from .planning import amount_decimal, financial_period
+from .analytics import period_metrics, limit_status, money
 
 
-MANUAL_ACTIONS = {"mtoday", "mcat", "msub", "mincat", "mcancel"}
+MANUAL_ACTIONS = {"mtoday", "mcat", "msub", "mincat", "mcancel", "mquick", "mall", "mdate"}
 
 
 class TelegramManualEntry:
     def __init__(self, bot: Any) -> None:
         self.bot = bot
+
+    def short(self, chat_id, text, message_id=None):
+        match = re.fullmatch(r"\s*([+-]?)\s*(\d+(?:[ \u00a0]\d{3})*(?:[,.]\d{1,2})?)(?:\s+(.+))?\s*", text)
+        if not match:
+            return False
+        sign, raw, description = match.groups()
+        value = amount_decimal(raw)
+        today = self.bot._analytics().today()
+        if sign == "+":
+            from .telegram_receipts import TelegramReceipts
+
+            TelegramReceipts(self.bot).start(
+                chat_id, ParsedOperation(today, description or "Поступление", value, OperationType.INCOME)
+            )
+            return True
+        state = {
+            "kind": "manual_entry",
+            "type": "expense",
+            "stage": "category",
+            "date": today.isoformat(),
+            "amount": float(value),
+            "name": description or "",
+            "nonce": secrets.token_hex(4),
+            "key": f"quick:{self.bot.context.storage.actor_id}:{chat_id}:{message_id or time.time_ns()}",
+            "cleanup_message_ids": [],
+        }
+        storage = self.bot.context.storage
+        choices = []
+        if description:
+            rule = storage.get_expense_category_rule(description)
+            if rule and self.bot.context.category_book.is_valid_expense(*rule):
+                choices = [rule]
+            else:
+                entries = storage.find_budget_entries(date.min, today, description, limit=100)
+                choices = sorted(
+                    {
+                        (row["category"], row["subcategory"])
+                        for row in entries
+                        if self.bot.context.category_book.is_valid_expense(row["category"], row["subcategory"])
+                    }
+                )
+            if len(choices) == 1:
+                state.update(category=choices[0][0], subcategory=choices[0][1])
+                self.write_operation(chat_id, manual_operation_from_state(state, description), state["key"])
+                return True
+        if not choices:
+            choices = [(row["category"], row["subcategory"]) for row in storage.frequent_categories(today)]
+        state["choices"] = [list(pair) for pair in choices]
+        buttons = [
+            [{"text": f"{cat} / {sub}", "callback_data": f"mquick:{state['nonce']}:{index}"}]
+            for index, (cat, sub) in enumerate(choices[:5])
+        ]
+        buttons += [
+            [
+                {"text": "Все категории", "callback_data": "mall:manual"},
+                {"text": "Изменить дату", "callback_data": "mdate:manual"},
+            ],
+            [{"text": "Отмена", "callback_data": "mcancel:manual"}],
+        ]
+        self.send_prompt(
+            chat_id,
+            state,
+            f"Расход {value} ₽ · {today:%d.%m.%Y}"
+            + (f" · {description}" if description else "")
+            + "\nВыбери категорию:",
+            reply_markup={"inline_keyboard": buttons},
+        )
+        return True
 
     def start(
         self,
@@ -65,11 +136,18 @@ class TelegramManualEntry:
 
         stage = state.get("stage")
         if stage == "date":
-            operation_date = date.today() if text == "Сегодня" else parse_user_operation_date(text, date.today().year)
+            today = self.bot._analytics().today()
+            operation_date = today if text == "Сегодня" else parse_user_operation_date(text, today.year)
             if operation_date is None:
                 self.send_prompt(chat_id, state, "Не понял дату. Напиши так: 22.08", reply_markup=manual_date_keyboard())
                 return
             state["date"] = operation_date.isoformat()
+            if state.get("amount"):
+                state["stage"] = "category"
+                self.send_prompt(
+                    chat_id, state, "Выбери категорию расхода:", reply_markup=self.category_keyboard(chat_id)
+                )
+                return
             state["stage"] = "amount"
             self.send_prompt(chat_id, state, "Теперь сумма. Можно писать 36857 или 36 857,50.")
             return
@@ -84,8 +162,10 @@ class TelegramManualEntry:
                 state["stage"] = "category"
                 self.send_prompt(chat_id, state, "Выбери категорию расхода:", reply_markup=self.category_keyboard(chat_id))
                 return
-            state["stage"] = "income_category"
-            self.send_prompt(chat_id, state, "Выбери категорию дохода:", reply_markup=self.income_category_keyboard(chat_id))
+            from .telegram_receipts import TelegramReceipts
+
+            self.bot.context.storage.delete_pending_action(pending["operation_hash"])
+            TelegramReceipts(self.bot).start(chat_id, manual_operation_from_state(state))
             return
 
         if stage == "description":
@@ -117,8 +197,27 @@ class TelegramManualEntry:
             self.bot._delete_callback_message(callback)
             self.bot._send_message(chat_id, "Ручное добавление отменено.", reply_markup=self.bot._main_reply_keyboard())
             return
+        if action == "mall":
+            self.send_prompt(chat_id, state, "Выбери категорию:", reply_markup=self.category_keyboard(chat_id))
+            return
+        if action == "mdate":
+            state["stage"] = "date"
+            self.send_prompt(chat_id, state, "Новая дата: ДД.ММ или ДД.ММ.ГГГГ")
+            return
+        if action == "mquick":
+            choices = state.get("choices", [])
+            nonce, index_text = payload.split(":")
+            if nonce != state.get("nonce"):
+                raise ValueError("Этот выбор устарел. Используй кнопки последнего ввода.")
+            index = int(index_text)
+            if not 0 <= index < len(choices) or not self.bot.context.category_book.is_valid_expense(*choices[index]):
+                raise ValueError("Категория изменилась. Нажми «Все категории».")
+            state.update(category=choices[index][0], subcategory=choices[index][1])
+            self.write_operation(chat_id, manual_operation_from_state(state, state.get("name")), state.get("key"))
+            self.bot.context.storage.delete_pending_action(pending_hash)
+            return
         if action == "mtoday":
-            state["date"] = date.today().isoformat()
+            state["date"] = self.bot._analytics().today().isoformat()
             state["stage"] = "amount"
             self.bot._answer_callback(callback["id"], "Сегодня")
             self.bot._delete_callback_message(callback)
@@ -167,7 +266,7 @@ class TelegramManualEntry:
             self.bot.context.storage.delete_pending_action(pending_hash)
             self.bot._answer_callback(callback["id"], f"{category} / {subcategory}")
             self.bot._delete_callback_message(callback)
-            self.write_operation(chat_id, operation)
+            self.write_operation(chat_id, operation, state.get("key"))
             return
         if action == "mincat":
             category_index = parse_index(payload, 1)
@@ -218,9 +317,10 @@ class TelegramManualEntry:
             prompt=manual_state_to_prompt(state),
         )
 
-    def write_operation(self, chat_id: int, operation: ParsedOperation) -> None:
+    def write_operation(self, chat_id: int, operation: ParsedOperation, key=None) -> None:
+        amount_decimal(operation.excel_amount)
         bank = f"manual:{chat_id}:{time.time_ns()}"
-        op_hash = make_operation_hash(bank, operation)
+        op_hash = key or make_operation_hash(bank, operation)
         first_row, _last_row = self.bot._write_operation_entries(op_hash, operation, bank, source="manual")
         self.bot.context.storage.record_operation(
             operation_hash=op_hash,
@@ -234,10 +334,26 @@ class TelegramManualEntry:
         summary_operations = [operation]
         if operation.type == OperationType.EXPENSE:
             summary_operations = _expense_operations_for_day(self.bot.context.storage, operation.date) or [operation]
+        lines = [
+            f"Засчитано: {operation.name} · {operation.date:%d.%m.%Y} · {operation.category} / {operation.subcategory or ''} · {operation.excel_amount:.2f} ₽"
+        ]
+        if operation.type == OperationType.EXPENSE:
+            self.bot.context.storage.save_expense_category_rule(
+                operation.name, operation.category, operation.subcategory
+            )
+            settings = self.bot.context.storage.analytics_settings()
+            start, end = financial_period(operation.date, settings.get("period_day", 1))
+            metrics = period_metrics(self.bot.context.storage.analytics_rows(start, end), settings, start, end)
+            limits = {item["category"]: item for item in limit_status(metrics, settings)}
+            item = limits.get(operation.category) or limits.get("")
+            if item:
+                lines.append(
+                    f"Остаток лимита ({item['category'] or 'общий'}, {start:%d.%m}–{end:%d.%m}): {money(item['remaining'])}"
+                )
         self.bot._send_message(
             chat_id,
-            "\n".join(self.bot._written_operation_summary_lines(summary_operations)),
-            reply_markup=self.bot._main_reply_keyboard(),
+            "\n".join(lines),
+            reply_markup={"inline_keyboard": [[{"text": "Исправить", "callback_data": f"entry:{first_row}"}]]},
         )
 
     def category_keyboard(self, chat_id: int) -> Dict[str, Any]:
@@ -324,7 +440,7 @@ def manual_operation_from_state(state: Dict[str, Any], name: Optional[str] = Non
     category = str(state.get("category") or "").strip() or None
     subcategory = str(state.get("subcategory") or "").strip() or None
     signed_amount = -abs(amount) if operation_type == OperationType.EXPENSE else abs(amount)
-    operation_name = (name or subcategory or category or "Ручная операция").strip()
+    operation_name = (name or state.get("name") or subcategory or category or "Ручная операция").strip()
     return ParsedOperation(
         date=operation_date,
         name=operation_name,

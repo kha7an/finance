@@ -37,7 +37,7 @@ def test_filter_excludes_rules_and_entries_but_keeps_income_and_balance():
     assert result["income"] == 2000
     assert result["count"] == 2
     assert result["categories"] == {"Дом": 200, "Еда": 400}
-    assert "Остаток за период: 300 ₽" in analytics_lines("balance", rows, settings(True), day)
+    assert "Движение денег: 300 ₽" in analytics_lines("balance", rows, settings(True), day)
     assert limit_status(result, settings(True))[1]["threshold"] == 80
     whole = settings(True)
     whole["mandatory_rules"] = [["Дом", ""]]

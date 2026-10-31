@@ -41,6 +41,7 @@ def expense_report_lines(summary: Dict[str, Any]) -> List[str]:
     if summary.get("previous_start_date"):
         lines.append(f"Сравнение с {summary['previous_start_date']:%d.%m.%Y}–{summary['previous_end_date']:%d.%m.%Y}")
     total = float(summary["total"])
+    lines.append(f"Возвраты учтены на момент формирования отчёта: {format_money(summary.get('adjustment',0))}")
     count = int(summary["count"] or 0)
     period_days = int(summary.get("period_days") or (end_date - start_date).days + 1)
     active_days = int(summary.get("active_days") or 0)

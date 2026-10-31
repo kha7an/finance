@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Uplo
 
 from .app_factory import AppContext, build_context
 from .log_config import get_logger, log_extra
+from .web_dashboard import router as dashboard_router
 
 
 logger = get_logger(__name__)
@@ -48,6 +49,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Budget Bot", version="0.2.0", lifespan=lifespan)
+app.include_router(dashboard_router)
 
 
 @app.middleware("http")

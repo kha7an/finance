@@ -38,7 +38,7 @@ class ParseJobWorker:
         )
 
         try:
-            with self.bot.context.owner_scope(owner_id):
+            with self.bot.context.storage.user_scope(payload.get("actor_id", owner_id), owner_id):
                 result = self._run_job(job, payload)
         except Exception as exc:
             error_text = str(exc)

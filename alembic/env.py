@@ -12,7 +12,7 @@ config = context.config
 if config.config_file_name is not None and os.getenv("ALEMBIC_USE_FILE_CONFIG", "").lower() in {"1", "true", "yes"}:
     fileConfig(config.config_file_name)
 
-database_url = os.getenv("DATABASE_URL")
+database_url = config.attributes.get("database_url") or os.getenv("DATABASE_URL")
 if database_url:
     config.set_main_option("sqlalchemy.url", sqlalchemy_url(database_url))
 

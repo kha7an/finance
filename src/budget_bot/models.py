@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 class OperationType(str, Enum):
     EXPENSE = "expense"
     INCOME = "income"
+    REIMBURSEMENT = "reimbursement"
     TRANSFER = "transfer"
     IGNORE = "ignore"
 

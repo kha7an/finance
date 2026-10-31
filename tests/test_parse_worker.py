@@ -58,6 +58,7 @@ class FakeBot:
     def __init__(self) -> None:
         self.storage = FakeStorage()
         self.context = FakeContext(self.storage)
+        self.storage.user_scope = lambda actor, budget: self.context.owner_scope(budget)
         self.send_owner_ids: List[str] = []
 
     def _download_file(self, file_id: str):

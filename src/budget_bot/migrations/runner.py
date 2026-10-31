@@ -15,6 +15,8 @@ def alembic_config(database_url: Optional[str] = None) -> Config:
     root = Path(__file__).resolve().parents[3]
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
+    if database_url:
+        config.attributes["database_url"] = database_url
     url = database_url or os.getenv("DATABASE_URL", "")
     if url:
         config.set_main_option("sqlalchemy.url", sqlalchemy_url(url))

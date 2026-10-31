@@ -69,6 +69,7 @@ class Settings:
     reminder_default_time: str
     api_token: str
     max_upload_bytes: int
+    web_base_url: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -96,6 +97,7 @@ class Settings:
             reminder_default_time=os.getenv("REMINDER_DEFAULT_TIME", "21:00").strip(),
             api_token=os.getenv("BUDGET_API_TOKEN", ""),
             max_upload_bytes=_int_env("MAX_UPLOAD_BYTES", 10 * 1024 * 1024),
+            web_base_url=_str_env("BUDGET_WEB_URL"),
         )
 
 
