@@ -4,6 +4,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -63,13 +64,18 @@ async def login(body: Login, request: Request):
         token = context.storage.issue_web_token(actor, "session")
     except (ValueError, IndexError):
         raise HTTPException(401, detail="Открой новую ссылку из команды /web в личном чате с ботом.") from None
-    response = JSONResponse({"ok": True})
+    payload = {"ok": True}
+    if body.init_data:
+        # Mini Apps in Telegram Web may run with third-party cookies blocked.
+        payload["session_token"] = token
+    response = JSONResponse(payload)
     response.set_cookie(
         "budget_session",
         token,
         max_age=86400,
         httponly=True,
-        secure=request.url.scheme == "https",
+        secure=request.url.scheme == "https"
+        or urlsplit(getattr(context.settings, "web_base_url", "")).scheme == "https",
         samesite="strict",
         path="/",
     )
@@ -79,15 +85,26 @@ async def login(body: Login, request: Request):
 
 @router.post("/api/logout")
 async def logout(request: Request):
-    request.app.state.context.storage.revoke_web_token(request.cookies.get("budget_session", ""))
+    request.app.state.context.storage.revoke_web_token(session_credential(request))
     response = JSONResponse({"ok": True})
     response.delete_cookie("budget_session")
+    response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def session_credential(request: Request) -> str:
+    authorization = request.headers.get("authorization")
+    if authorization is None:
+        return request.cookies.get("budget_session", "")
+    scheme, separator, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not separator or not token:
+        raise HTTPException(401, detail="Недействительная сессия.")
+    return token
 
 
 async def authorized(request: Request, budget: str = ""):
     context = request.app.state.context
-    actor = context.storage.web_identity(request.cookies.get("budget_session", ""))
+    actor = context.storage.web_identity(session_credential(request))
     if not actor or not allowed(context, int(actor.split(":")[1])):
         raise HTTPException(401, detail="Войди через Telegram: команда /web.")
     try:

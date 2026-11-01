@@ -1,5 +1,7 @@
 .DS_Store
 .env
+.env.*
+data/backups/
 .git
 .idea
 .pytest_cache

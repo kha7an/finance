@@ -4,6 +4,7 @@ import json
 from decimal import Decimal
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import urlsplit
 
 from .analytics import money
 from .planning import amount_decimal
@@ -333,6 +334,27 @@ class TelegramPlanning:
             url = self.bot.context.settings.web_base_url
             if not url:
                 raise ValueError("Для панели укажи BUDGET_WEB_URL — адрес /dashboard на сервере API.")
+            address = urlsplit(url)
+            if (
+                address.scheme not in {"http", "https"}
+                or not address.hostname
+                or address.username
+                or address.password
+                or address.fragment
+            ):
+                raise ValueError("BUDGET_WEB_URL должен содержать HTTP/HTTPS-адрес без пароля и фрагмента.")
+            if address.scheme == "https":
+                web_app = {"url": url}
+                self.bot._api(
+                    "setChatMenuButton",
+                    {"chat_id": chat, "menu_button": {"type": "web_app", "text": "Бюджет", "web_app": web_app}},
+                )
+                self.bot._send_message(
+                    chat,
+                    "Открой бюджет внутри Telegram:",
+                    reply_markup={"inline_keyboard": [[{"text": "Открыть приложение", "web_app": web_app}]]},
+                )
+                return True
             token = self.storage.issue_web_token(self.storage.actor_id)
             self.bot._send_message(
                 chat,
