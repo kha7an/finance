@@ -1,7 +1,9 @@
-"""Read-only dashboard API. All money calculations stay on the server."""
+"""Dashboard and purchase editing API. Money calculations stay on the server."""
 
 from datetime import date, datetime
 from decimal import Decimal
+from hashlib import sha256
+import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit
@@ -9,10 +11,11 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .analytics import period_metrics, is_mandatory
-from .planning import financial_period
+from .models import OperationType, ParsedOperation
+from .planning import amount_decimal, financial_period
 from .web_auth import validate_init_data
 
 router = APIRouter()
@@ -22,6 +25,22 @@ ASSETS = Path(__file__).parent / "web"
 class Login(BaseModel):
     token: str = ""
     init_data: str = ""
+
+
+class PurchaseEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    operation_date: date
+    amount: Decimal
+    name: str = Field(min_length=1, max_length=500)
+    category: str = Field(min_length=1, max_length=64)
+    subcategory: str = Field(min_length=1, max_length=64)
+    version: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def validate_amount(cls, value):
+        return amount_decimal(value)
 
 
 @router.get("/dashboard")
@@ -189,7 +208,72 @@ async def purchase(entry_id: int, context=Depends(authorized)):
         row = context.storage.get_budget_entry(entry_id)
         if not row or row["operation_type"] != "expense":
             raise HTTPException(404, detail="Покупка не найдена.")
-        payload = {"purchase": row, "reimbursements": context.storage.reimbursements(entry_id)}
+        payload = purchase_payload(context.storage, row)
+    return JSONResponse(
+        jsonable_encoder(payload, custom_encoder={Decimal: str}), headers={"Cache-Control": "no-store"}
+    )
+
+
+def purchase_version(row):
+    # Compare the whole record: timestamps elsewhere have only second precision.
+    encoded = jsonable_encoder(row, custom_encoder={Decimal: str})
+    return sha256(json.dumps(encoded, sort_keys=True).encode()).hexdigest()
+
+
+def can_edit_purchase(storage, row):
+    return storage.actor_id in {storage.owner_id, row["author_id"]} or any(
+        member["user_id"] == storage.actor_id and member["role"] == "owner"
+        for member in storage.budget_members()
+    )
+
+
+def purchase_payload(storage, row):
+    return {
+        "purchase": row,
+        "reimbursements": storage.reimbursements(row["id"]),
+        "can_edit": can_edit_purchase(storage, row),
+        "version": purchase_version(row),
+        "categories": [item for item in storage.category_catalog() if item["kind"] == "expense"],
+    }
+
+
+@router.put("/api/purchases/{entry_id}")
+async def edit_purchase(
+    entry_id: int,
+    body: PurchaseEdit,
+    x_budget_edit: str = Header(""),
+    context=Depends(authorized),
+):
+    # A cross-origin page cannot send this header without an allowed CORS preflight.
+    if x_budget_edit != "1":
+        raise HTTPException(403, detail="Сохраните запись через приложение.")
+    storage = context.storage
+    with storage.atomic():
+        row = storage.get_budget_entry(entry_id)
+        if not row or row["operation_type"] != "expense":
+            raise HTTPException(404, detail="Покупка не найдена.")
+        if not can_edit_purchase(storage, row):
+            raise HTTPException(403, detail="Можно изменять свои записи. Владелец бюджета может изменять любые.")
+        if body.version != purchase_version(row):
+            raise HTTPException(409, detail="Запись уже изменилась. Загрузите актуальную версию перед редактированием.")
+        if not storage.category_book().is_valid_expense(body.category, body.subcategory):
+            raise HTTPException(422, detail="Выберите категорию и подкатегорию из справочника бюджета.")
+        try:
+            storage.update_budget_entry(
+                entry_id,
+                ParsedOperation(
+                    date=body.operation_date,
+                    name=body.name,
+                    amount=-body.amount,
+                    type=OperationType.EXPENSE,
+                    category=body.category,
+                    subcategory=body.subcategory,
+                    note=row.get("note") or "",
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(422, detail=str(exc)) from None
+        payload = purchase_payload(storage, storage.get_budget_entry(entry_id))
     return JSONResponse(
         jsonable_encoder(payload, custom_encoder={Decimal: str}), headers={"Cache-Control": "no-store"}
     )
