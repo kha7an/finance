@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import mimetypes
+import socket
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 import requests
+from urllib3.connection import HTTPSConnection
+from urllib3.connectionpool import HTTPSConnectionPool
 
 from .log_config import get_logger, log_extra
 
@@ -23,6 +26,32 @@ TELEGRAM_POLLING_ERROR_SLEEP_SECONDS = 5.0
 TELEGRAM_POLLING_CONFLICT_SLEEP_SECONDS = 60.0
 
 
+class _LocalDnsHTTPSConnection(HTTPSConnection):
+    def _tunnel(self) -> None:
+        hostname = self._tunnel_host
+        try:
+            self._tunnel_host = socket.gethostbyname(hostname)
+            super()._tunnel()
+        finally:
+            # Restore the name for TLS SNI and certificate verification after CONNECT.
+            self._tunnel_host = hostname
+
+
+class _LocalDnsHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = _LocalDnsHTTPSConnection
+
+
+class _LocalDnsProxyAdapter(requests.adapters.HTTPAdapter):
+    def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
+        manager = super().proxy_manager_for(proxy, **proxy_kwargs)
+        if not proxy.lower().startswith("socks"):
+            manager.pool_classes_by_scheme = {
+                **manager.pool_classes_by_scheme,
+                "https": _LocalDnsHTTPSConnectionPool,
+            }
+        return manager
+
+
 class TelegramApiClient:
     def __init__(self, bot: Any) -> None:
         self.bot = bot
@@ -34,6 +63,8 @@ class TelegramApiClient:
         self.timeout = settings.telegram_timeout_seconds
         self.session.trust_env = settings.use_env_proxy and not settings.telegram_proxy_url
         if settings.telegram_proxy_url:
+            if settings.telegram_proxy_url.lower().startswith(("http://", "https://")):
+                self.session.mount("https://", _LocalDnsProxyAdapter())
             self.session.proxies.update(
                 {
                     "http": settings.telegram_proxy_url,
