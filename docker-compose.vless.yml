@@ -9,14 +9,14 @@ services:
 
   bot:
     environment:
-      TELEGRAM_PROXY_URL: http://xray:8080
+      TELEGRAM_PROXY_URL: ${TELEGRAM_PROXY_URL:-http://xray:8080}
     depends_on:
       xray:
         condition: service_started
 
   api:
     environment:
-      TELEGRAM_PROXY_URL: http://xray:8080
+      TELEGRAM_PROXY_URL: ${TELEGRAM_PROXY_URL:-http://xray:8080}
     depends_on:
       xray:
         condition: service_started
